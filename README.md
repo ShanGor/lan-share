@@ -1,6 +1,6 @@
 # Lan Transfer
 
-LAN file transfer tool with Swing UI and UDP transport (Netty). Implements chunked UDP file transfer with per-chunk CRC32, per-file MD5, bitmap-based resend of missing chunks, and resumable tasks.
+LAN file transfer tool with Swing UI and UDP transport (Netty). Implements chunked UDP file transfer with XOR-obscured chunk bodies, per-file MD5, bitmap-based resend of missing chunks, and resumable tasks.
 
 ## Requirements
 - Java 17

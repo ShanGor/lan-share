@@ -10,6 +10,7 @@ import com.lantransfer.core.protocol.FileCompleteMessage;
 import com.lantransfer.core.protocol.FileMetaMessage;
 import com.lantransfer.core.protocol.FileResendRequestMessage;
 import com.lantransfer.core.protocol.FileSendDoneMessage;
+import com.lantransfer.core.protocol.DirectoryCreateMessage;
 import com.lantransfer.core.protocol.ProtocolIO;
 import com.lantransfer.core.protocol.ProtocolMessage;
 import com.lantransfer.core.protocol.TaskCompleteMessage;
@@ -35,7 +36,6 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
-import java.util.zip.CRC32;
 
 public class TransferReceiverService implements AutoCloseable {
     private static final Logger log = Logger.getLogger(TransferReceiverService.class.getName());
@@ -71,6 +71,7 @@ public class TransferReceiverService implements AutoCloseable {
                 case FILE_META -> onFileMeta(sender, (FileMetaMessage) msg);
                 case FILE_CHUNK -> onFileChunk(sender, (FileChunkMessage) msg);
                 case FILE_SEND_DONE -> onFileSendDone(sender, (FileSendDoneMessage) msg);
+                case DIR_CREATE -> onDirCreate(sender, (DirectoryCreateMessage) msg);
                 default -> {
                 }
             }
@@ -125,9 +126,28 @@ public class TransferReceiverService implements AutoCloseable {
         }
         Files.createDirectories(target.getParent());
         Path tempFile = target.resolveSibling(target.getFileName() + ".part");
+        Files.deleteIfExists(tempFile);
+        Files.createFile(tempFile);
         int chunks = (int) Math.ceil((double) msg.size() / ChunkHeader.MAX_BODY_SIZE);
         FileChunkBitmap bitmap = new FileChunkBitmap(tempFile.resolveSibling(tempFile.getFileName() + ".bitmap"), chunks);
         ctx.files.put(msg.fileId(), new ReceiverFile(target, tempFile, msg.size(), msg.md5(), bitmap));
+    }
+
+    private void onDirCreate(InetSocketAddress sender, DirectoryCreateMessage msg) {
+        ReceiverContext ctx = contexts.get(msg.taskId());
+        if (ctx == null) {
+            return;
+        }
+        Path target = destinationRoot.resolve(msg.relativePath()).normalize();
+        if (!target.startsWith(destinationRoot)) {
+            log.warning("Rejected directory outside destination: " + target);
+            return;
+        }
+        try {
+            Files.createDirectories(target);
+        } catch (IOException e) {
+            log.log(Level.WARNING, "Failed to create directory " + target, e);
+        }
     }
 
     private void onFileChunk(InetSocketAddress sender, FileChunkMessage msg) {
@@ -145,7 +165,7 @@ public class TransferReceiverService implements AutoCloseable {
         }
         ByteBuffer buffer = ByteBuffer.wrap(chunk);
         long seq = buffer.getLong();
-        int crc = buffer.getInt();
+        byte xorKey = buffer.get();
         short bodySize = buffer.getShort();
         if (bodySize < 0 || bodySize > ChunkHeader.MAX_BODY_SIZE) {
             return;
@@ -153,14 +173,11 @@ public class TransferReceiverService implements AutoCloseable {
         if (chunk.length < ChunkHeader.HEADER_SIZE + bodySize) {
             return;
         }
-        // verify CRC32 over full chunk
-        CRC32 crc32 = new CRC32();
-        crc32.update(chunk, 0, ChunkHeader.HEADER_SIZE + bodySize);
-        if ((int) crc32.getValue() != crc) {
-            return;
-        }
         byte[] body = new byte[bodySize];
         buffer.get(body);
+        for (int i = 0; i < bodySize; i++) {
+            body[i] = (byte) (body[i] ^ xorKey);
+        }
         long offset = seq * ChunkHeader.MAX_BODY_SIZE;
         try (RandomAccessFile raf = new RandomAccessFile(rf.tempFile.toFile(), "rw")) {
             raf.seek(offset);

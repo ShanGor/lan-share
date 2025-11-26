@@ -9,13 +9,14 @@ import com.lantransfer.core.protocol.FileCompleteMessage;
 import com.lantransfer.core.protocol.FileMetaMessage;
 import com.lantransfer.core.protocol.FileResendRequestMessage;
 import com.lantransfer.core.protocol.FileSendDoneMessage;
+import com.lantransfer.core.protocol.DirectoryCreateMessage;
 import com.lantransfer.core.protocol.ProtocolIO;
 import com.lantransfer.core.protocol.ProtocolMessage;
 import com.lantransfer.core.protocol.TaskCompleteMessage;
 import com.lantransfer.core.protocol.TransferOfferMessage;
 import com.lantransfer.core.protocol.TransferResponseMessage;
 import com.lantransfer.ui.common.TaskTableModel;
-import io.netty.util.internal.ThreadLocalRandom;
+import java.util.concurrent.ThreadLocalRandom;
 
 import java.io.FileInputStream;
 import java.io.IOException;
@@ -36,7 +37,6 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
-import java.util.zip.CRC32;
 
 public class TransferSenderService implements AutoCloseable {
     private static final Logger log = Logger.getLogger(TransferSenderService.class.getName());
@@ -70,6 +70,7 @@ public class TransferSenderService implements AutoCloseable {
         executor.submit(() -> {
             try {
                 List<Path> files = listFiles(folder);
+                List<Path> dirs = listDirs(folder);
                 long totalBytes = files.stream().mapToLong(p -> {
                     try {
                         return Files.size(p);
@@ -89,7 +90,7 @@ public class TransferSenderService implements AutoCloseable {
                 send(receiver, offer);
 
                 CompletableFuture<TransferResponseMessage> responseFuture = new CompletableFuture<>();
-                contexts.put(taskRequestId, new SenderContext(task, receiver, files, folder, responseFuture));
+                contexts.put(taskRequestId, new SenderContext(task, receiver, files, dirs, folder, responseFuture));
 
                 TransferResponseMessage response = responseFuture.get(10, TimeUnit.SECONDS);
                 if (!response.accepted()) {
@@ -101,11 +102,20 @@ public class TransferSenderService implements AutoCloseable {
                 ctx.taskId = taskId;
                 contexts.put(taskId, ctx);
                 task.setStatus(TransferStatus.IN_PROGRESS);
+                sendDirectories(ctx);
                 sendFiles(ctx);
             } catch (Exception e) {
                 log.log(Level.SEVERE, "Send folder failed", e);
             }
         });
+    }
+
+    private void sendDirectories(SenderContext ctx) throws IOException {
+        for (Path dir : ctx.directories) {
+            String rel = ctx.root.relativize(dir).toString();
+            DirectoryCreateMessage msg = new DirectoryCreateMessage(ctx.taskId, rel);
+            send(ctx.receiver, msg);
+        }
     }
 
     private void sendFiles(SenderContext ctx) throws IOException {
@@ -157,19 +167,17 @@ public class TransferSenderService implements AutoCloseable {
         return seq;
     }
 
-    private byte[] buildChunkBytes(int seq, byte[] body, int bodySize) throws IOException {
+    private byte[] buildChunkBytes(int seq, byte[] body, int bodySize) {
+        byte xorKey = (byte) ThreadLocalRandom.current().nextInt(0, 256);
         byte[] chunk = new byte[ChunkHeader.HEADER_SIZE + bodySize];
         ByteBuffer headerBuf = ByteBuffer.wrap(chunk);
         headerBuf.putLong(seq);
-        headerBuf.putInt(0); // placeholder for CRC
+        headerBuf.put(xorKey);
         headerBuf.putShort((short) bodySize);
         headerBuf.position(ChunkHeader.HEADER_SIZE);
-        headerBuf.put(body, 0, bodySize);
-        CRC32 crc32 = new CRC32();
-        crc32.update(chunk, 0, chunk.length);
-        int crc = (int) crc32.getValue();
-        headerBuf.putLong(0, seq);
-        headerBuf.putInt(8, crc);
+        for (int i = 0; i < bodySize; i++) {
+            chunk[ChunkHeader.HEADER_SIZE + i] = (byte) (body[i] ^ xorKey);
+        }
         return chunk;
     }
 
@@ -272,6 +280,15 @@ public class TransferSenderService implements AutoCloseable {
         return files;
     }
 
+    private List<Path> listDirs(Path folder) throws IOException {
+        List<Path> dirs = new ArrayList<>();
+        Files.walk(folder)
+                .filter(Files::isDirectory)
+                .filter(p -> !p.equals(folder))
+                .forEach(dirs::add);
+        return dirs;
+    }
+
     @Override
     public void close() {
         endpoint.close();
@@ -283,16 +300,18 @@ public class TransferSenderService implements AutoCloseable {
         final TransferTask task;
         final InetSocketAddress receiver;
         final List<Path> files;
+        final List<Path> directories;
         final Path root;
         String taskId;
         final CompletableFuture<TransferResponseMessage> responseFuture;
         final Map<Integer, ScheduledFuture<?>> timeouts = new ConcurrentHashMap<>();
         final Map<Integer, Integer> chunkCounts = new ConcurrentHashMap<>();
 
-        SenderContext(TransferTask task, InetSocketAddress receiver, List<Path> files, Path root, CompletableFuture<TransferResponseMessage> responseFuture) {
+        SenderContext(TransferTask task, InetSocketAddress receiver, List<Path> files, List<Path> directories, Path root, CompletableFuture<TransferResponseMessage> responseFuture) {
             this.task = task;
             this.receiver = receiver;
             this.files = files;
+            this.directories = directories;
             this.root = root;
             this.responseFuture = responseFuture;
         }

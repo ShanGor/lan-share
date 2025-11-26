@@ -10,5 +10,6 @@ public enum ProtocolMessageType {
     FILE_RESEND_REQUEST,
     TASK_COMPLETE,
     TASK_CANCEL,
+    DIR_CREATE,
     HEARTBEAT_ACK
 }

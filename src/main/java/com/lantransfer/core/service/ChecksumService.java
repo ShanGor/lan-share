@@ -6,7 +6,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.util.zip.CRC32;
 
 public class ChecksumService {
 
@@ -22,12 +21,6 @@ public class ChecksumService {
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("MD5 not available", e);
         }
-    }
-
-    public int crc32(byte[] data, int length) {
-        CRC32 crc = new CRC32();
-        crc.update(data, 0, length);
-        return (int) crc.getValue();
     }
 
     private static String bytesToHex(byte[] bytes) {
