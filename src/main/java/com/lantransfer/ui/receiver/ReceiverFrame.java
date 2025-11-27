@@ -27,6 +27,7 @@ public class ReceiverFrame extends JFrame {
     private final TaskRegistry taskRegistry = new TaskRegistry();
     private final TaskTableModel tableModel = new TaskTableModel();
     private final TransferReceiverService receiverService = new TransferReceiverService(taskRegistry, tableModel);
+    private final JLabel statusLabel = new JLabel("Status: Idle");
 
     public ReceiverFrame() {
         super("Lan Transfer - Receiver");
@@ -45,6 +46,8 @@ public class ReceiverFrame extends JFrame {
         destField.setEditable(false);
         JButton browseButton = new JButton("Browse...");
         JButton listenButton = new JButton("Start Listening");
+        JButton stopButton = new JButton("Stop Listening");
+        stopButton.setEnabled(false);
 
         gbc.gridx = 0; gbc.gridy = 0; form.add(portLabel, gbc);
         gbc.gridx = 1; gbc.gridy = 0; gbc.weightx = 1; form.add(portField, gbc);
@@ -52,6 +55,8 @@ public class ReceiverFrame extends JFrame {
         gbc.gridx = 1; gbc.gridy = 1; gbc.weightx = 1; form.add(destField, gbc);
         gbc.gridx = 2; gbc.gridy = 1; gbc.weightx = 0; form.add(browseButton, gbc);
         gbc.gridx = 1; gbc.gridy = 2; gbc.weightx = 0; form.add(listenButton, gbc);
+        gbc.gridx = 2; gbc.gridy = 2; gbc.weightx = 0; form.add(stopButton, gbc);
+        gbc.gridx = 1; gbc.gridy = 3; gbc.weightx = 0; form.add(statusLabel, gbc);
 
         add(form, BorderLayout.NORTH);
 
@@ -79,11 +84,27 @@ public class ReceiverFrame extends JFrame {
             try {
                 int port = Integer.parseInt(portText);
                 receiverService.start(port, Path.of(dest));
+                listenButton.setEnabled(false);
+                stopButton.setEnabled(true);
+                portField.setEnabled(false);
+                browseButton.setEnabled(false);
+                statusLabel.setText("Status: Listening on port " + port);
             } catch (NumberFormatException ex) {
                 JOptionPane.showMessageDialog(this, "Port must be a number.", "Validation", JOptionPane.WARNING_MESSAGE);
             } catch (InterruptedException ex) {
                 Thread.currentThread().interrupt();
+            } catch (Exception ex) {
+                JOptionPane.showMessageDialog(this, "Failed to start listening: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
             }
+        });
+
+        stopButton.addActionListener(e -> {
+            receiverService.close();
+            listenButton.setEnabled(true);
+            stopButton.setEnabled(false);
+            portField.setEnabled(true);
+            browseButton.setEnabled(true);
+            statusLabel.setText("Status: Stopped");
         });
 
         setSize(720, 480);

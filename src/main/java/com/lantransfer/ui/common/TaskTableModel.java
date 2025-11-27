@@ -42,8 +42,8 @@ public class TaskTableModel extends AbstractTableModel {
             case 0 -> task.getTaskId();
             case 1 -> task.getStatus();
             case 2 -> progress(task);
-            case 3 -> task.getBytesTransferred();
-            case 4 -> task.getTotalBytes();
+            case 3 -> formatBytes(task.getBytesTransferred());
+            case 4 -> formatBytes(task.getTotalBytes());
             default -> "";
         };
     }
@@ -73,5 +73,9 @@ public class TaskTableModel extends AbstractTableModel {
 
     public void refresh() {
         fireTableDataChanged();
+    }
+
+    private String formatBytes(long value) {
+        return String.format("%,d", value);
     }
 }

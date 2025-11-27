@@ -12,6 +12,12 @@ mvn clean package
 ```
 Note: this downloads `io.netty:netty-all:4.2.7.Final`. Ensure network access to Maven Central.
 
+To build a runnable jar with dependencies:
+```bash
+mvn clean package
+# output: target/lan-transfer-0.1.0-SNAPSHOT-jar-with-dependencies.jar
+```
+
 ## Run
 ```bash
 mvn exec:java -Dexec.mainClass=com.lantransfer.LanTransferApp
@@ -19,6 +25,11 @@ mvn exec:java -Dexec.mainClass=com.lantransfer.LanTransferApp
 or run the packaged jar:
 ```bash
 java -jar target/lan-transfer-0.1.0-SNAPSHOT.jar
+```
+
+Or run the fat jar with dependencies:
+```bash
+java -jar target/lan-transfer-0.1.0-SNAPSHOT-jar-with-dependencies.jar
 ```
 
 ## Status

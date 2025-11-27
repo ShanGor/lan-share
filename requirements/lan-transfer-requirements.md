@@ -32,7 +32,7 @@ Single-purpose LAN file transfer tool with GUI. Sender chooses a folder, Receive
 
 ## Functional Requirements
 - **Task management (sender)**: Show list with task id, receiver, status (Pending, In-Progress, Rejected, Failed, Completed, Resending, Canceled), per-file progress, total progress, start/end timestamps. Allow cancel of an active task.
-- **Listening (receiver)**: Configure listen port; show current listening status; list active/finished transfers with task id, sender address, status, per-file progress.
+- **Listening (receiver)**: Configure listen port; show current listening status; start/stop listening; list active/finished transfers with task id, sender address, status, per-file progress.
 - **Folder traversal**: Recursive; preserve relative paths when writing on receiver.
 - **File metadata**: For each file send relative path, size (bytes), and MD5 hex; receiver uses MD5 to verify after transfer.
 - **Chunking**:
@@ -89,6 +89,7 @@ Message bodies use a simple binary framing; all multi-byte fields in big-endian.
 - Logging: Structured logs per task (info/warn/error) for troubleshooting; include task id and file path.
 - Security: LAN use; no encryption/authentication; validate paths to prevent directory traversal.
 - Resume: Persist enough state (e.g., task list, per-file progress, bitmap files) to resume in-progress tasks after application restart.
+- Packaging: Provide a runnable artifact that includes all dependencies (fat jar).
 
 ## Assumptions and Decisions
 - IPv4-only support; IPv6 is out of scope.

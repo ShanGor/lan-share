@@ -92,7 +92,7 @@ public class TransferSenderService implements AutoCloseable {
                 CompletableFuture<TransferResponseMessage> responseFuture = new CompletableFuture<>();
                 contexts.put(taskRequestId, new SenderContext(task, receiver, files, dirs, folder, responseFuture));
 
-                TransferResponseMessage response = responseFuture.get(10, TimeUnit.SECONDS);
+                TransferResponseMessage response = responseFuture.get(30, TimeUnit.SECONDS);
                 if (!response.accepted()) {
                     task.setStatus(TransferStatus.REJECTED);
                     return;
@@ -130,12 +130,27 @@ public class TransferSenderService implements AutoCloseable {
             ctx.chunkCounts.put(fileId, totalChunks);
             send(ctx.receiver, new FileSendDoneMessage(ctx.taskId, fileId, totalChunks));
             scheduleFileDoneTimeout(ctx, fileId, 0);
+            CompletableFuture<Boolean> doneFuture = new CompletableFuture<>();
+            ctx.fileDoneFutures.put(fileId, doneFuture);
+            try {
+                boolean ok = doneFuture.get(30, TimeUnit.SECONDS);
+                if (!ok) {
+                    ctx.task.setStatus(TransferStatus.FAILED);
+                    return;
+                }
+            } catch (Exception e) {
+                ctx.task.setStatus(TransferStatus.FAILED);
+                return;
+            } finally {
+                ctx.clearTimeout(fileId);
+                ctx.fileDoneFutures.remove(fileId);
+            }
             fileId++;
         }
     }
 
     private void scheduleFileDoneTimeout(SenderContext ctx, int fileId, int attempt) {
-        if (attempt >= 3) {
+        if (attempt >= 5) {
             ctx.task.setStatus(TransferStatus.FAILED);
             return;
         }
@@ -245,6 +260,7 @@ public class TransferSenderService implements AutoCloseable {
             return;
         }
         log.info("File complete: " + msg);
+        CompletableFuture<Boolean> future = ctx.fileDoneFutures.get(msg.fileId());
         if (!msg.success()) {
             ctx.task.setStatus(TransferStatus.RESENDING);
             Path file = ctx.files.get(msg.fileId());
@@ -255,9 +271,15 @@ public class TransferSenderService implements AutoCloseable {
             } catch (IOException e) {
                 log.log(Level.WARNING, "Failed to resend file", e);
                 ctx.task.setStatus(TransferStatus.FAILED);
+                if (future != null) {
+                    future.complete(false);
+                }
             }
         } else {
             ctx.clearTimeout(msg.fileId());
+            if (future != null) {
+                future.complete(true);
+            }
         }
     }
 
@@ -306,6 +328,7 @@ public class TransferSenderService implements AutoCloseable {
         final CompletableFuture<TransferResponseMessage> responseFuture;
         final Map<Integer, ScheduledFuture<?>> timeouts = new ConcurrentHashMap<>();
         final Map<Integer, Integer> chunkCounts = new ConcurrentHashMap<>();
+        final Map<Integer, CompletableFuture<Boolean>> fileDoneFutures = new ConcurrentHashMap<>();
 
         SenderContext(TransferTask task, InetSocketAddress receiver, List<Path> files, List<Path> directories, Path root, CompletableFuture<TransferResponseMessage> responseFuture) {
             this.task = task;

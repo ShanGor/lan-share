@@ -109,6 +109,7 @@ public class TransferReceiverService implements AutoCloseable {
                 result[0] = choice == JOptionPane.YES_OPTION;
             });
         } catch (Exception e) {
+            log.log(Level.WARNING, "Failed to prompt for incoming transfer", e);
             result[0] = false;
         }
         return result[0];
@@ -199,6 +200,9 @@ public class TransferReceiverService implements AutoCloseable {
         }
         ReceiverFile rf = ctx.files.get(msg.fileId());
         if (rf == null) {
+            // Missing metadata; request full resend by signaling failure.
+            sendUnchecked(sender, new FileCompleteMessage(msg.taskId(), msg.fileId(), false));
+            ctx.task.setStatus(TransferStatus.RESENDING);
             return;
         }
         BitSet missing = rf.bitmap.missingChunks();

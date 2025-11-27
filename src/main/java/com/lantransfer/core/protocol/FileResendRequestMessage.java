@@ -26,6 +26,13 @@ public record FileResendRequestMessage(String taskId, int fileId, int[] missingS
         String taskId = ProtocolIO.readString(in);
         int fileId = in.readInt();
         int count = in.readInt();
+        if (count < 0) {
+            throw new IOException("Negative missing sequence count");
+        }
+        int available = in.available();
+        if (available < count * 4) {
+            throw new IOException("Truncated FILE_RESEND_REQUEST payload: expected " + (count * 4) + " bytes but only " + available);
+        }
         int[] missing = new int[count];
         for (int i = 0; i < count; i++) {
             missing[i] = in.readInt();
