@@ -205,6 +205,10 @@ public class TransferReceiverService implements AutoCloseable {
             ctx.task.setStatus(TransferStatus.RESENDING);
             return;
         }
+        if (!rf.bitmap.isInitialized()) {
+            // Total chunk count unknown; wait until metadata processed fully.
+            return;
+        }
         BitSet missing = rf.bitmap.missingChunks();
         if (!missing.isEmpty()) {
             int[] missingIdx = missing.stream().toArray();
