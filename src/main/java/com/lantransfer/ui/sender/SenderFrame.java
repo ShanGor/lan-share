@@ -4,6 +4,8 @@ import com.lantransfer.core.service.TaskRegistry;
 import com.lantransfer.core.service.TransferSenderService;
 import com.lantransfer.ui.common.ProgressCellRenderer;
 import com.lantransfer.ui.common.TaskTableModel;
+import com.lantransfer.core.util.UserPreferences;
+import com.lantransfer.core.util.UserPreferences.SenderSettings;
 
 import javax.swing.JButton;
 import javax.swing.JFileChooser;
@@ -49,6 +51,11 @@ public class SenderFrame extends JFrame {
         JButton browseButton = new JButton("Browse...");
         JButton sendButton = new JButton("Send");
 
+        SenderSettings senderPrefs = UserPreferences.loadSenderSettings();
+        hostField.setText(senderPrefs.host());
+        portField.setText(Integer.toString(senderPrefs.port()));
+        folderField.setText(senderPrefs.folder());
+
         gbc.gridx = 0; gbc.gridy = 0; form.add(hostLabel, gbc);
         gbc.gridx = 1; gbc.gridy = 0; gbc.weightx = 1; form.add(hostField, gbc);
         gbc.gridx = 0; gbc.gridy = 1; gbc.weightx = 0; form.add(portLabel, gbc);
@@ -91,6 +98,7 @@ public class SenderFrame extends JFrame {
             try {
                 int port = Integer.parseInt(portText);
                 senderService.sendFolder(Path.of(folder), new InetSocketAddress(host, port), tableModel);
+                UserPreferences.saveSenderSettings(new SenderSettings(host, port, folder));
             } catch (NumberFormatException ex) {
                 JOptionPane.showMessageDialog(this, "Port must be a number.", "Validation", JOptionPane.WARNING_MESSAGE);
             }

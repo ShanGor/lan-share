@@ -23,7 +23,7 @@ Single-purpose LAN file transfer tool with GUI. Sender chooses a folder, Receive
 2) Sender starts in sender mode, chooses a folder, enters receiver host/IP and port, clicks Send.
 3) Receiver gets a transfer offer dialog (folder name, total size, file count) and Accept/Reject.
 4) If rejected, sender marks task as Rejected and stops.
-5) If accepted, sender receives a task id (UUID string) from receiver, shows it in the task list, and transfer begins.
+5) If accepted, sender keeps using its generated 16-bit task id (shown in the UI). Receiver echoes it in the response, and transfer begins.
 6) Sender walks the folder recursively, sending each file.
 7) For each file, sender sends metadata (relative path, size, MD5) before data chunks.
 8) Receiver writes chunks in order, de-obscures chunk bodies using the XOR byte, and validates MD5 after full file.
@@ -33,20 +33,21 @@ Single-purpose LAN file transfer tool with GUI. Sender chooses a folder, Receive
 ## Functional Requirements
 - **Task management (sender)**: Show list with task id, receiver, status (Pending, In-Progress, Rejected, Failed, Completed, Resending, Canceled), per-file progress, total progress, start/end timestamps. Allow cancel of an active task.
 - **Listening (receiver)**: Configure listen port; show current listening status; start/stop listening; list active/finished transfers with task id, sender address, status, per-file progress.
+- **Session memory**: Remember last-used sender inputs (host, port, folder) and receiver inputs (port, destination) and reload them at startup.
 - **Folder traversal**: Recursive; preserve relative paths when writing on receiver.
 - **File metadata**: For each file send relative path, size (bytes), and MD5 hex; receiver uses MD5 to verify after transfer.
 - **Chunking**:
-  - Chunk size: 1011 bytes total (11-byte header + up to 1000-byte body).
-  - Header layout:
-    - Bytes 0-7: `long` sequence number (monotonic per file, starting at 0).
-    - Byte 8: `byte` XOR key used to obfuscate/de-obfuscate the chunk body.
-    - Bytes 9-10: `short` body size (0–1000).
-  - Body: up to 1000 bytes of file data, each byte XOR’ed with the header’s XOR key before send; receiver applies the same XOR to recover data.
+  - Protocol task id: unsigned 16-bit number (2 bytes). Sender derives it from the low 16 bits of the current timestamp (retrying on collision). Every protocol message carries this task id.
+  - File id: unsigned 32-bit number (4 bytes) assigned incrementally per file within a task.
+  - Chunk sequence: unsigned 64-bit number (8 bytes) per file, starting at 0.
+  - Chunk header size: 15 bytes = taskId(2) + fileId(4) + chunkSeq(8) + xorKey(1) + bodySize(2). Body remains up to 1000 bytes, XOR’ed with the xor key; receiver applies the same XOR to recover data.
 - **Checksum rules**:
   - No per-chunk CRC32. Integrity is ensured by MD5 per file after full receipt; on failure receiver requests full-file resend.
 - **Resend behavior**:
   - Receiver maintains a bitmap file per transferring file on disk; 1 bit per chunk (1 = received, 0 = missing). Bitmap persists until file verified and is reused when resuming after restarts.
-  - After the sender finishes sending all chunks of a file, it sends a file-send-done signal. Receiver checks the bitmap; if any 0 bits remain, it requests only the missing chunks from the sender, then re-runs MD5.
+  - Sender uses stop-and-wait per chunk: send a chunk, wait for the receiver’s ACK (taskId + fileId + chunkSeq), retransmit after timeout (configurable, limited retries), then move to the next chunk.
+  - Receiver acknowledges each chunk via `CHUNK_ACK` message containing taskId(2) + fileId(4) + chunkSeq(8). Duplicate chunks are detected via the bitmap and re-ACKed without rewriting data.
+  - After a file’s final chunk is ACKed, sender emits `FILE_SEND_DONE`. Receiver checks bitmap; if any chunks are still missing, it issues a `FILE_RESEND_REQUEST` listing the chunkSeq values required.
   - Receiver may request resend of a specific file; sender re-sends metadata and data for that file.
   - When a file passes MD5 verification, receiver sends a file-done signal so sender and receiver can log completion and update task progress.
   - Chunk-level retransmission strategy required to cope with UDP loss (see Reliability).
@@ -59,7 +60,8 @@ Message bodies use a simple binary framing; all multi-byte fields in big-endian.
 - `TRANSFER_OFFER`: sender→receiver; includes task request id, folder name, total bytes, file count.
 - `TRANSFER_RESPONSE`: receiver→sender; Accept/Reject plus receiver-generated task id on accept.
 - `FILE_META`: sender→receiver; includes task id, relative path, file size, MD5 (hex string), file index/order.
-- `FILE_CHUNK`: sender→receiver; includes task id, file id/index, and the 11-byte chunk header + body defined above.
+- `FILE_CHUNK`: sender→receiver; stop-and-wait payload containing the 15-byte header (taskId, fileId, chunkSeq, xor key, body size) plus XOR’ed body bytes.
+- `CHUNK_ACK`: receiver→sender; acknowledges a single chunk (taskId(2), fileId(4), chunkSeq(8)).
 - `FILE_SEND_DONE`: sender→receiver; indicates all chunks for a file have been sent, prompting bitmap check and any missing-chunk requests.
 - `FILE_COMPLETE`: receiver→sender; acknowledges file receipt and MD5 result (OK/FAIL). On OK, both sides log completion and update task lists.
 - `FILE_RESEND_REQUEST`: receiver→sender; identifies file needing resend.
@@ -68,13 +70,13 @@ Message bodies use a simple binary framing; all multi-byte fields in big-endian.
 - `HEARTBEAT/ACK`: optional; used for reliability/keepalive (see Reliability).
 
 ## Reliability and Ordering (UDP)
-- Implement lightweight acknowledgements:
-  - Per-chunk ACK or sliding-window ACK (by highest contiguous sequence); sender retransmits unacked chunks after timeout.
-  - Detect missing chunks via sequence numbers; receiver requests retransmit.
+- Implement stop-and-wait acknowledgements:
+  - Each chunk must be ACKed (taskId + fileId + chunkSeq) before the sender transmits the next chunk; retransmit after a timeout (configurable) with capped retries.
+  - Receiver tracks missing chunk sequences via bitmap and requests retransmission if a `FILE_SEND_DONE` arrives before all chunks are ACKed.
 - Retransmission timeouts and max retries should be configurable (defaults reasonable for LAN).
 - Ensure in-order reassembly per file; drop duplicates.
 - Handle out-of-order delivery.
-- If retries exhausted for a file, mark task Failed and notify user.
+- If retries exhausted for a file, mark the task as `Failed` and notify user.
 
 ## UI Requirements (Swing)
 - Sender main view: source folder picker, receiver host/port fields, Send button, task list with progress bars, status, and cancel control; detail pane showing current file, speed, ETA.

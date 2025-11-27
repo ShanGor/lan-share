@@ -5,7 +5,7 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.util.Arrays;
 
-public record FileResendRequestMessage(String taskId, int fileId, int[] missingSequences)
+public record FileResendRequestMessage(int taskId, int fileId, long[] missingSequences)
         implements ProtocolMessage {
     @Override
     public ProtocolMessageType type() {
@@ -14,28 +14,24 @@ public record FileResendRequestMessage(String taskId, int fileId, int[] missingS
 
     @Override
     public void write(DataOutputStream out) throws IOException {
-        ProtocolIO.writeString(out, taskId);
+        out.writeShort(taskId & 0xFFFF);
         out.writeInt(fileId);
         out.writeInt(missingSequences.length);
-        for (int seq : missingSequences) {
-            out.writeInt(seq);
+        for (long seq : missingSequences) {
+            out.writeLong(seq);
         }
     }
 
     public static FileResendRequestMessage read(DataInputStream in) throws IOException {
-        String taskId = ProtocolIO.readString(in);
+        int taskId = in.readUnsignedShort();
         int fileId = in.readInt();
         int count = in.readInt();
         if (count < 0) {
             throw new IOException("Negative missing sequence count");
         }
-        int available = in.available();
-        if (available < count * 4) {
-            throw new IOException("Truncated FILE_RESEND_REQUEST payload: expected " + (count * 4) + " bytes but only " + available);
-        }
-        int[] missing = new int[count];
+        long[] missing = new long[count];
         for (int i = 0; i < count; i++) {
-            missing[i] = in.readInt();
+            missing[i] = in.readLong();
         }
         return new FileResendRequestMessage(taskId, fileId, missing);
     }
@@ -43,7 +39,7 @@ public record FileResendRequestMessage(String taskId, int fileId, int[] missingS
     @Override
     public String toString() {
         return "FileResendRequestMessage{" +
-                "taskId='" + taskId + '\'' +
+                "taskId=" + taskId +
                 ", fileId=" + fileId +
                 ", missingSequences=" + Arrays.toString(missingSequences) +
                 '}';

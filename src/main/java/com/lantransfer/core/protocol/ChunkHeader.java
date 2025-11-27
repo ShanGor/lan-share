@@ -1,19 +1,32 @@
 package com.lantransfer.core.protocol;
 
 import java.nio.ByteBuffer;
+
 public class ChunkHeader {
-    public static final int HEADER_SIZE = 11;
     public static final int MAX_BODY_SIZE = 1000;
+    public static final int HEADER_SIZE = 2 + 4 + 8 + 1 + 2;
     public static final int MAX_CHUNK_SIZE = HEADER_SIZE + MAX_BODY_SIZE;
 
+    private final int taskId;
+    private final int fileId;
     private final long sequence;
     private final byte xorKey;
     private final short bodySize;
 
-    public ChunkHeader(long sequence, byte xorKey, short bodySize) {
+    public ChunkHeader(int taskId, int fileId, long sequence, byte xorKey, short bodySize) {
+        this.taskId = taskId & 0xFFFF;
+        this.fileId = fileId;
         this.sequence = sequence;
         this.xorKey = xorKey;
         this.bodySize = bodySize;
+    }
+
+    public int taskId() {
+        return taskId;
+    }
+
+    public int fileId() {
+        return fileId;
     }
 
     public long sequence() {
@@ -28,19 +41,12 @@ public class ChunkHeader {
         return bodySize;
     }
 
-    public ByteBuffer encode() {
-        ByteBuffer buffer = ByteBuffer.allocate(HEADER_SIZE);
-        buffer.putLong(sequence);
-        buffer.put(xorKey);
-        buffer.putShort(bodySize);
-        buffer.flip();
-        return buffer;
-    }
-
     public static ChunkHeader decode(ByteBuffer buffer) {
+        int taskId = buffer.getShort() & 0xFFFF;
+        int fileId = buffer.getInt();
         long seq = buffer.getLong();
         byte xor = buffer.get();
         short size = buffer.getShort();
-        return new ChunkHeader(seq, xor, size);
+        return new ChunkHeader(taskId, fileId, seq, xor, size);
     }
 }

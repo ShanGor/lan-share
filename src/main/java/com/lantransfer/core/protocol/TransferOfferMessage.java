@@ -4,7 +4,7 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 
-public record TransferOfferMessage(String taskRequestId,
+public record TransferOfferMessage(int taskId,
                                    String folderName,
                                    long totalBytes,
                                    int fileCount) implements ProtocolMessage {
@@ -16,17 +16,17 @@ public record TransferOfferMessage(String taskRequestId,
 
     @Override
     public void write(DataOutputStream out) throws IOException {
-        ProtocolIO.writeString(out, taskRequestId);
+        out.writeShort(taskId & 0xFFFF);
         ProtocolIO.writeString(out, folderName);
         out.writeLong(totalBytes);
         out.writeInt(fileCount);
     }
 
     public static TransferOfferMessage read(DataInputStream in) throws IOException {
-        String taskRequestId = ProtocolIO.readString(in);
+        int taskId = in.readUnsignedShort();
         String folderName = ProtocolIO.readString(in);
         long totalBytes = in.readLong();
         int fileCount = in.readInt();
-        return new TransferOfferMessage(taskRequestId, folderName, totalBytes, fileCount);
+        return new TransferOfferMessage(taskId, folderName, totalBytes, fileCount);
     }
 }

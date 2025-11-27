@@ -11,18 +11,15 @@ public class FileChunkBitmap {
     private final Path bitmapPath;
     private final int chunkCount;
     private final BitSet bits;
-    private final boolean initialized;
 
     public FileChunkBitmap(Path bitmapPath, int chunkCount) throws IOException {
         this.bitmapPath = bitmapPath;
         this.chunkCount = chunkCount;
         if (Files.exists(bitmapPath)) {
             this.bits = BitSet.valueOf(Files.readAllBytes(bitmapPath));
-            this.initialized = true;
         } else {
             this.bits = new BitSet(chunkCount);
             persist();
-            this.initialized = false;
         }
     }
 
@@ -48,10 +45,6 @@ public class FileChunkBitmap {
         missing.set(0, chunkCount);
         missing.andNot(bits);
         return missing;
-    }
-
-    public boolean isInitialized() {
-        return initialized || bits.length() > 0;
     }
 
     private void persist() throws IOException {

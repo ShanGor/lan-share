@@ -3,28 +3,29 @@ package com.lantransfer.core.service;
 import com.lantransfer.core.model.TransferStatus;
 import com.lantransfer.core.model.TransferTask;
 import com.lantransfer.core.net.UdpEndpoint;
+import com.lantransfer.core.protocol.ChunkAckMessage;
+import com.lantransfer.core.protocol.DirectoryCreateMessage;
 import com.lantransfer.core.protocol.ChunkHeader;
 import com.lantransfer.core.protocol.FileChunkMessage;
 import com.lantransfer.core.protocol.FileCompleteMessage;
 import com.lantransfer.core.protocol.FileMetaMessage;
 import com.lantransfer.core.protocol.FileResendRequestMessage;
 import com.lantransfer.core.protocol.FileSendDoneMessage;
-import com.lantransfer.core.protocol.DirectoryCreateMessage;
 import com.lantransfer.core.protocol.ProtocolIO;
 import com.lantransfer.core.protocol.ProtocolMessage;
+import com.lantransfer.core.protocol.TaskCancelMessage;
 import com.lantransfer.core.protocol.TaskCompleteMessage;
 import com.lantransfer.core.protocol.TransferOfferMessage;
 import com.lantransfer.core.protocol.TransferResponseMessage;
 import com.lantransfer.ui.common.TaskTableModel;
-import java.util.concurrent.ThreadLocalRandom;
 
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -40,12 +41,15 @@ import java.util.logging.Logger;
 
 public class TransferSenderService implements AutoCloseable {
     private static final Logger log = Logger.getLogger(TransferSenderService.class.getName());
+    private static final int CHUNK_ACK_TIMEOUT_SECONDS = 2;
+    private static final int MAX_CHUNK_RETRY = 5;
+    private static final int FILE_DONE_TIMEOUT_SECONDS = 30;
 
     private final UdpEndpoint endpoint = new UdpEndpoint();
     private final TaskRegistry taskRegistry;
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
-    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
-    private final Map<String, SenderContext> contexts = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
+    private final Map<Integer, SenderContext> contexts = new ConcurrentHashMap<>();
 
     public TransferSenderService(TaskRegistry taskRegistry) {
         this.taskRegistry = taskRegistry;
@@ -67,233 +71,268 @@ public class TransferSenderService implements AutoCloseable {
         if (!Files.isDirectory(folder)) {
             throw new IllegalArgumentException("Folder does not exist: " + folder);
         }
-        executor.submit(() -> {
-            try {
-                List<Path> files = listFiles(folder);
-                List<Path> dirs = listDirs(folder);
-                long totalBytes = files.stream().mapToLong(p -> {
-                    try {
-                        return Files.size(p);
-                    } catch (IOException e) {
-                        return 0L;
-                    }
-                }).sum();
-                String taskRequestId = "req-" + ThreadLocalRandom.current().nextLong(Long.MAX_VALUE);
-                TransferTask task = new TransferTask(folder, Path.of(""), totalBytes);
-                task.setStatus(TransferStatus.PENDING);
-                taskRegistry.add(task);
-                if (tableModel != null) {
-                    tableModel.addTask(task);
-                }
+        executor.submit(() -> sendFolderInternal(folder, receiver, tableModel));
+    }
 
-                TransferOfferMessage offer = new TransferOfferMessage(taskRequestId, folder.getFileName().toString(), totalBytes, files.size());
-                send(receiver, offer);
-
-                CompletableFuture<TransferResponseMessage> responseFuture = new CompletableFuture<>();
-                contexts.put(taskRequestId, new SenderContext(task, receiver, files, dirs, folder, responseFuture));
-
-                TransferResponseMessage response = responseFuture.get(30, TimeUnit.SECONDS);
-                if (!response.accepted()) {
-                    task.setStatus(TransferStatus.REJECTED);
-                    return;
-                }
-                String taskId = response.taskId();
-                SenderContext ctx = contexts.remove(taskRequestId);
-                ctx.taskId = taskId;
-                contexts.put(taskId, ctx);
-                task.setStatus(TransferStatus.IN_PROGRESS);
-                sendDirectories(ctx);
-                sendFiles(ctx);
-            } catch (Exception e) {
-                log.log(Level.SEVERE, "Send folder failed", e);
+    private void sendFolderInternal(Path folder, InetSocketAddress receiver, TaskTableModel tableModel) {
+        SenderContext ctx = null;
+        int protocolId = TaskIdGenerator.nextId();
+        try {
+            List<Path> files = listFiles(folder);
+            List<Path> dirs = listDirs(folder);
+            long totalBytes = totalSize(files);
+            TransferTask task = new TransferTask(protocolId, folder, Path.of(""), totalBytes);
+            task.setStatus(TransferStatus.PENDING);
+            taskRegistry.add(task);
+            if (tableModel != null) {
+                tableModel.addTask(task);
             }
-        });
+
+            ctx = new SenderContext(protocolId, task, receiver, files, dirs, folder);
+            contexts.put(protocolId, ctx);
+
+            send(receiver, new TransferOfferMessage(protocolId, folder.getFileName().toString(), totalBytes, files.size()));
+
+            boolean accepted = ctx.acceptFuture.get(30, TimeUnit.SECONDS);
+            if (!accepted) {
+                task.setStatus(TransferStatus.REJECTED);
+                return;
+            }
+
+            task.setStatus(TransferStatus.IN_PROGRESS);
+            sendDirectories(ctx);
+            sendFiles(ctx);
+        } catch (Exception e) {
+            log.log(Level.SEVERE, "Send folder failed", e);
+            if (ctx != null) {
+                ctx.task.setStatus(TransferStatus.FAILED);
+            }
+        } finally {
+            if (ctx != null) {
+                ctx.cleanup();
+            }
+            contexts.remove(protocolId);
+            TaskIdGenerator.release(protocolId);
+        }
     }
 
     private void sendDirectories(SenderContext ctx) throws IOException {
         for (Path dir : ctx.directories) {
             String rel = ctx.root.relativize(dir).toString();
-            DirectoryCreateMessage msg = new DirectoryCreateMessage(ctx.taskId, rel);
-            send(ctx.receiver, msg);
+            send(ctx.receiver, new DirectoryCreateMessage(ctx.taskId, rel));
         }
     }
 
-    private void sendFiles(SenderContext ctx) throws IOException {
+    private void sendFiles(SenderContext ctx) throws Exception {
         int fileId = 0;
         for (Path file : ctx.files) {
             long size = Files.size(file);
+            long totalChunks = (size + ChunkHeader.MAX_BODY_SIZE - 1) / ChunkHeader.MAX_BODY_SIZE;
+            ctx.chunkCounts.put(fileId, totalChunks);
             String relPath = ctx.root.relativize(file).toString();
             String md5 = new ChecksumService().md5(file);
-            FileMetaMessage meta = new FileMetaMessage(ctx.taskId, fileId, relPath, size, md5);
-            send(ctx.receiver, meta);
-            int totalChunks = sendFileChunks(ctx, fileId, file);
-            ctx.chunkCounts.put(fileId, totalChunks);
-            send(ctx.receiver, new FileSendDoneMessage(ctx.taskId, fileId, totalChunks));
-            scheduleFileDoneTimeout(ctx, fileId, 0);
+            send(ctx.receiver, new FileMetaMessage(ctx.taskId, fileId, relPath, size, md5));
+
+            sendFileChunks(ctx, fileId, file, totalChunks);
+
             CompletableFuture<Boolean> doneFuture = new CompletableFuture<>();
             ctx.fileDoneFutures.put(fileId, doneFuture);
-            try {
-                boolean ok = doneFuture.get(30, TimeUnit.SECONDS);
-                if (!ok) {
-                    ctx.task.setStatus(TransferStatus.FAILED);
-                    return;
-                }
-            } catch (Exception e) {
+            send(ctx.receiver, new FileSendDoneMessage(ctx.taskId, fileId, totalChunks));
+            scheduleFileDoneTimeout(ctx, fileId, 0);
+            boolean ok = doneFuture.get(FILE_DONE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            ctx.clearFileTimeout(fileId);
+            ctx.fileDoneFutures.remove(fileId);
+            if (!ok) {
                 ctx.task.setStatus(TransferStatus.FAILED);
                 return;
-            } finally {
-                ctx.clearTimeout(fileId);
-                ctx.fileDoneFutures.remove(fileId);
             }
             fileId++;
         }
     }
 
-    private void scheduleFileDoneTimeout(SenderContext ctx, int fileId, int attempt) {
-        if (attempt >= 5) {
+    private void sendFileChunks(SenderContext ctx, int fileId, Path file, long totalChunks) throws Exception {
+        try (FileInputStream fis = new FileInputStream(file.toFile())) {
+            byte[] buffer = new byte[ChunkHeader.MAX_BODY_SIZE];
+            long seq = 0;
+            int read;
+            while ((read = fis.read(buffer)) != -1) {
+                byte[] plain = Arrays.copyOf(buffer, read);
+                sendChunkAndAwaitAck(ctx, fileId, seq, plain);
+                ctx.task.addBytesTransferred(read);
+                seq++;
+            }
+            if (seq != totalChunks) {
+                log.warning("Chunk count mismatch for " + file + ": expected " + totalChunks + ", sent " + seq);
+            }
+        }
+    }
+
+    private void sendChunkAndAwaitAck(SenderContext ctx, int fileId, long seq, byte[] plain) throws Exception {
+        ChunkKey key = new ChunkKey(fileId, seq);
+        CompletableFuture<Void> ackFuture = new CompletableFuture<>();
+        ctx.chunkAckFutures.put(key, ackFuture);
+        ctx.inflightChunks.put(key, new ChunkInFlight(plain));
+        transmitChunk(ctx, fileId, seq, plain);
+        scheduleChunkRetry(ctx, key, 0);
+        try {
+            ackFuture.get(CHUNK_ACK_TIMEOUT_SECONDS * (MAX_CHUNK_RETRY + 1L), TimeUnit.SECONDS);
+        } finally {
+            ctx.chunkAckFutures.remove(key);
+            ctx.cancelChunkTimeout(key);
+            ctx.inflightChunks.remove(key);
+        }
+    }
+
+    private void transmitChunk(SenderContext ctx, int fileId, long seq, byte[] plain) throws IOException {
+        byte xorKey = (byte) (System.nanoTime() & 0xFF);
+        byte[] encoded = new byte[plain.length];
+        for (int i = 0; i < plain.length; i++) {
+            encoded[i] = (byte) (plain[i] ^ xorKey);
+        }
+        send(ctx.receiver, new FileChunkMessage(ctx.taskId, fileId, seq, xorKey, encoded));
+    }
+
+    private void scheduleChunkRetry(SenderContext ctx, ChunkKey key, int attempt) {
+        if (attempt >= MAX_CHUNK_RETRY) {
             ctx.task.setStatus(TransferStatus.FAILED);
+            CompletableFuture<Void> future = ctx.chunkAckFutures.remove(key);
+            if (future != null) {
+                future.completeExceptionally(new IOException("Chunk ack retries exceeded"));
+            }
             return;
         }
         ScheduledFuture<?> future = scheduler.schedule(() -> {
-            log.info("Retrying file-send-done for fileId=" + fileId + ", attempt=" + (attempt + 1));
+            ChunkInFlight inflight = ctx.inflightChunks.get(key);
+            if (inflight == null) {
+                return;
+            }
+            log.info("Retrying chunk " + key + " for task " + ctx.taskId + ", attempt " + (attempt + 1));
             try {
-                int totalChunks = ctx.chunkCounts.getOrDefault(fileId, 0);
+                transmitChunk(ctx, key.fileId(), key.sequence(), inflight.data());
+            } catch (IOException e) {
+                log.log(Level.WARNING, "Failed to resend chunk " + key, e);
+            }
+            scheduleChunkRetry(ctx, key, attempt + 1);
+        }, CHUNK_ACK_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        ctx.trackChunkTimeout(key, future);
+    }
+
+    private void scheduleFileDoneTimeout(SenderContext ctx, int fileId, int attempt) {
+        if (attempt >= MAX_CHUNK_RETRY) {
+            ctx.task.setStatus(TransferStatus.FAILED);
+            CompletableFuture<Boolean> future = ctx.fileDoneFutures.remove(fileId);
+            if (future != null) {
+                future.complete(false);
+            }
+            return;
+        }
+        ScheduledFuture<?> future = scheduler.schedule(() -> {
+            long totalChunks = ctx.chunkCounts.getOrDefault(fileId, 0L);
+            Path file = ctx.files.get(fileId);
+            log.info("Retrying file-send-done for fileId=" + fileId + " (" + file + "), attempt=" + (attempt + 1));
+            try {
                 send(ctx.receiver, new FileSendDoneMessage(ctx.taskId, fileId, totalChunks));
             } catch (IOException e) {
                 log.log(Level.WARNING, "Failed to resend file-send-done", e);
             }
             scheduleFileDoneTimeout(ctx, fileId, attempt + 1);
         }, 2, TimeUnit.SECONDS);
-        ctx.trackTimeout(fileId, future);
+        ctx.trackFileTimeout(fileId, future);
     }
 
-    private int sendFileChunks(SenderContext ctx, int fileId, Path file) throws IOException {
-        int seq = 0;
-        try (FileInputStream fis = new FileInputStream(file.toFile())) {
-            byte[] body = new byte[ChunkHeader.MAX_BODY_SIZE];
-            int read;
-            while ((read = fis.read(body)) != -1) {
-                byte[] chunkBytes = buildChunkBytes(seq, body, read);
-                send(ctx.receiver, new FileChunkMessage(ctx.taskId, fileId, chunkBytes));
-                ctx.task.addBytesTransferred(read);
-                seq++;
-            }
-        }
-        return seq;
-    }
-
-    private byte[] buildChunkBytes(int seq, byte[] body, int bodySize) {
-        byte xorKey = (byte) ThreadLocalRandom.current().nextInt(0, 256);
-        byte[] chunk = new byte[ChunkHeader.HEADER_SIZE + bodySize];
-        ByteBuffer headerBuf = ByteBuffer.wrap(chunk);
-        headerBuf.putLong(seq);
-        headerBuf.put(xorKey);
-        headerBuf.putShort((short) bodySize);
-        headerBuf.position(ChunkHeader.HEADER_SIZE);
-        for (int i = 0; i < bodySize; i++) {
-            chunk[ChunkHeader.HEADER_SIZE + i] = (byte) (body[i] ^ xorKey);
-        }
-        return chunk;
-    }
-
-    private void handleIncoming(InetSocketAddress addr, ProtocolMessage msg) {
+    private void handleIncoming(InetSocketAddress sender, ProtocolMessage msg) {
         switch (msg.type()) {
-            case TRANSFER_RESPONSE -> {
-                TransferResponseMessage response = (TransferResponseMessage) msg;
-                SenderContext ctx = contexts.get(response.taskRequestId());
-                if (ctx != null) {
-                    ctx.responseFuture.complete(response);
-                }
-            }
-            case FILE_RESEND_REQUEST -> handleResendRequest((FileResendRequestMessage) msg);
-            case FILE_COMPLETE -> handleFileComplete((FileCompleteMessage) msg);
-            case TASK_COMPLETE -> handleTaskComplete((TaskCompleteMessage) msg);
-            default -> {
-            }
+            case TRANSFER_RESPONSE -> onTransferResponse((TransferResponseMessage) msg);
+            case CHUNK_ACK -> onChunkAck((ChunkAckMessage) msg);
+            case FILE_COMPLETE -> onFileComplete((FileCompleteMessage) msg);
+            case FILE_RESEND_REQUEST -> onFileResendRequest((FileResendRequestMessage) msg);
+            case TASK_COMPLETE -> onTaskComplete((TaskCompleteMessage) msg);
+            default -> log.fine("Ignoring message type " + msg.type());
         }
     }
 
-    private void handleResendRequest(FileResendRequestMessage msg) {
+    private void onTransferResponse(TransferResponseMessage msg) {
+        SenderContext ctx = contexts.get(msg.taskId());
+        if (ctx != null) {
+            ctx.acceptFuture.complete(msg.accepted());
+        }
+    }
+
+    private void onChunkAck(ChunkAckMessage msg) {
+        SenderContext ctx = contexts.get(msg.taskId());
+        if (ctx == null) {
+            return;
+        }
+        ChunkKey key = new ChunkKey(msg.fileId(), msg.chunkSeq());
+        CompletableFuture<Void> future = ctx.chunkAckFutures.get(key);
+        if (future != null) {
+            future.complete(null);
+        }
+    }
+
+    private void onFileComplete(FileCompleteMessage msg) {
+        SenderContext ctx = contexts.get(msg.taskId());
+        if (ctx == null) {
+            return;
+        }
+        CompletableFuture<Boolean> future = ctx.fileDoneFutures.get(msg.fileId());
+        if (future != null) {
+            future.complete(msg.success());
+        }
+    }
+
+    private void onFileResendRequest(FileResendRequestMessage msg) {
         SenderContext ctx = contexts.get(msg.taskId());
         if (ctx == null) {
             return;
         }
         Path file = ctx.files.get(msg.fileId());
-        try {
-            for (int seq : msg.missingSequences()) {
-                byte[] body = readChunkBody(file, seq);
-                int bodySize = body.length;
-                byte[] chunkBytes = buildChunkBytes(seq, body, bodySize);
-                send(ctx.receiver, new FileChunkMessage(msg.taskId(), msg.fileId(), chunkBytes));
-            }
-        } catch (IOException e) {
-            log.log(Level.WARNING, "Failed to resend chunks", e);
-        }
-    }
-
-    private byte[] readChunkBody(Path file, int seq) throws IOException {
-        try (FileInputStream fis = new FileInputStream(file.toFile())) {
-            long skip = (long) seq * ChunkHeader.MAX_BODY_SIZE;
-            long skipped = fis.skip(skip);
-            while (skipped < skip) {
-                long s = fis.skip(skip - skipped);
-                if (s <= 0) break;
-                skipped += s;
-            }
-            byte[] body = new byte[ChunkHeader.MAX_BODY_SIZE];
-            int read = fis.read(body);
-            if (read < 0) {
-                return new byte[0];
-            }
-            if (read == body.length) {
-                return body;
-            }
-            byte[] trimmed = new byte[read];
-            System.arraycopy(body, 0, trimmed, 0, read);
-            return trimmed;
-        }
-    }
-
-    private void handleFileComplete(FileCompleteMessage msg) {
-        SenderContext ctx = contexts.get(msg.taskId());
-        if (ctx == null) {
-            return;
-        }
-        log.info("File complete: " + msg);
-        CompletableFuture<Boolean> future = ctx.fileDoneFutures.get(msg.fileId());
-        if (!msg.success()) {
-            ctx.task.setStatus(TransferStatus.RESENDING);
-            Path file = ctx.files.get(msg.fileId());
+        for (long seq : msg.missingSequences()) {
             try {
-                int totalChunks = sendFileChunks(ctx, msg.fileId(), file);
-                send(ctx.receiver, new FileSendDoneMessage(msg.taskId(), msg.fileId(), totalChunks));
-                scheduleFileDoneTimeout(ctx, msg.fileId(), 0);
-            } catch (IOException e) {
-                log.log(Level.WARNING, "Failed to resend file", e);
-                ctx.task.setStatus(TransferStatus.FAILED);
-                if (future != null) {
-                    future.complete(false);
+                byte[] data = readChunk(file, seq);
+                if (data.length == 0) {
+                    continue;
                 }
-            }
-        } else {
-            ctx.clearTimeout(msg.fileId());
-            if (future != null) {
-                future.complete(true);
+                transmitChunk(ctx, msg.fileId(), seq, data);
+            } catch (IOException e) {
+                log.log(Level.WARNING, "Failed to resend chunk seq " + seq + " for fileId " + msg.fileId(), e);
             }
         }
     }
 
-    private void handleTaskComplete(TaskCompleteMessage msg) {
+    private void onTaskComplete(TaskCompleteMessage msg) {
         SenderContext ctx = contexts.get(msg.taskId());
         if (ctx != null) {
             ctx.task.setStatus(TransferStatus.COMPLETED);
-            ctx.clearAllTimeouts();
         }
     }
 
-    private void send(InetSocketAddress recipient, ProtocolMessage msg) throws IOException {
-        byte[] data = ProtocolIO.toByteArray(msg);
-        endpoint.send(recipient, data);
+    private byte[] readChunk(Path file, long seq) throws IOException {
+        try (FileInputStream fis = new FileInputStream(file.toFile())) {
+            long skip = seq * ChunkHeader.MAX_BODY_SIZE;
+            long skipped = fis.skip(skip);
+            while (skipped < skip) {
+                long s = fis.skip(skip - skipped);
+                if (s <= 0) {
+                    break;
+                }
+                skipped += s;
+            }
+            byte[] buf = new byte[ChunkHeader.MAX_BODY_SIZE];
+            int read = fis.read(buf);
+            if (read < 0) {
+                return new byte[0];
+            }
+            return Arrays.copyOf(buf, read);
+        }
+    }
+
+    private long totalSize(List<Path> files) throws IOException {
+        long total = 0L;
+        for (Path p : files) {
+            total += Files.size(p);
+        }
+        return total;
     }
 
     private List<Path> listFiles(Path folder) throws IOException {
@@ -311,53 +350,83 @@ public class TransferSenderService implements AutoCloseable {
         return dirs;
     }
 
+    private void send(InetSocketAddress recipient, ProtocolMessage msg) throws IOException {
+        endpoint.send(recipient, ProtocolIO.toByteArray(msg));
+    }
+
     @Override
     public void close() {
         endpoint.close();
         executor.shutdownNow();
         scheduler.shutdownNow();
+        contexts.values().forEach(SenderContext::cleanup);
+        contexts.clear();
     }
 
-    private static class SenderContext {
+    private static final class SenderContext {
+        final int taskId;
         final TransferTask task;
         final InetSocketAddress receiver;
         final List<Path> files;
         final List<Path> directories;
         final Path root;
-        String taskId;
-        final CompletableFuture<TransferResponseMessage> responseFuture;
-        final Map<Integer, ScheduledFuture<?>> timeouts = new ConcurrentHashMap<>();
-        final Map<Integer, Integer> chunkCounts = new ConcurrentHashMap<>();
+        final CompletableFuture<Boolean> acceptFuture = new CompletableFuture<>();
+        final Map<Integer, Long> chunkCounts = new ConcurrentHashMap<>();
         final Map<Integer, CompletableFuture<Boolean>> fileDoneFutures = new ConcurrentHashMap<>();
+        final Map<Integer, ScheduledFuture<?>> fileTimeouts = new ConcurrentHashMap<>();
+        final Map<ChunkKey, CompletableFuture<Void>> chunkAckFutures = new ConcurrentHashMap<>();
+        final Map<ChunkKey, ScheduledFuture<?>> chunkTimeouts = new ConcurrentHashMap<>();
+        final Map<ChunkKey, ChunkInFlight> inflightChunks = new ConcurrentHashMap<>();
 
-        SenderContext(TransferTask task, InetSocketAddress receiver, List<Path> files, List<Path> directories, Path root, CompletableFuture<TransferResponseMessage> responseFuture) {
+        SenderContext(int taskId, TransferTask task, InetSocketAddress receiver, List<Path> files,
+                      List<Path> directories, Path root) {
+            this.taskId = taskId;
             this.task = task;
             this.receiver = receiver;
             this.files = files;
             this.directories = directories;
             this.root = root;
-            this.responseFuture = responseFuture;
         }
 
-        void trackTimeout(int fileId, ScheduledFuture<?> future) {
-            ScheduledFuture<?> previous = timeouts.put(fileId, future);
-            if (previous != null) {
-                previous.cancel(false);
+        void trackFileTimeout(int fileId, ScheduledFuture<?> future) {
+            ScheduledFuture<?> prev = fileTimeouts.put(fileId, future);
+            if (prev != null) {
+                prev.cancel(false);
             }
         }
 
-        void clearTimeout(int fileId) {
-            ScheduledFuture<?> future = timeouts.remove(fileId);
+        void clearFileTimeout(int fileId) {
+            ScheduledFuture<?> future = fileTimeouts.remove(fileId);
             if (future != null) {
                 future.cancel(false);
             }
         }
 
-        void clearAllTimeouts() {
-            for (ScheduledFuture<?> f : timeouts.values()) {
-                f.cancel(false);
+        void trackChunkTimeout(ChunkKey key, ScheduledFuture<?> future) {
+            ScheduledFuture<?> prev = chunkTimeouts.put(key, future);
+            if (prev != null) {
+                prev.cancel(false);
             }
-            timeouts.clear();
+        }
+
+        void cancelChunkTimeout(ChunkKey key) {
+            ScheduledFuture<?> future = chunkTimeouts.remove(key);
+            if (future != null) {
+                future.cancel(false);
+            }
+        }
+
+        void cleanup() {
+            fileTimeouts.values().forEach(f -> f.cancel(false));
+            chunkTimeouts.values().forEach(f -> f.cancel(false));
+            fileTimeouts.clear();
+            chunkTimeouts.clear();
+            chunkAckFutures.values().forEach(f -> f.cancel(true));
+            fileDoneFutures.values().forEach(f -> f.cancel(true));
         }
     }
+
+    private record ChunkKey(int fileId, long sequence) {}
+
+    private record ChunkInFlight(byte[] data) {}
 }

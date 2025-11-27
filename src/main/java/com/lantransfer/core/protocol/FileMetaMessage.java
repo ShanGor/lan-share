@@ -4,7 +4,7 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 
-public record FileMetaMessage(String taskId, int fileId, String relativePath, long size, String md5)
+public record FileMetaMessage(int taskId, int fileId, String relativePath, long size, String md5)
         implements ProtocolMessage {
     @Override
     public ProtocolMessageType type() {
@@ -13,7 +13,7 @@ public record FileMetaMessage(String taskId, int fileId, String relativePath, lo
 
     @Override
     public void write(DataOutputStream out) throws IOException {
-        ProtocolIO.writeString(out, taskId);
+        out.writeShort(taskId & 0xFFFF);
         out.writeInt(fileId);
         ProtocolIO.writeString(out, relativePath);
         out.writeLong(size);
@@ -21,7 +21,7 @@ public record FileMetaMessage(String taskId, int fileId, String relativePath, lo
     }
 
     public static FileMetaMessage read(DataInputStream in) throws IOException {
-        String taskId = ProtocolIO.readString(in);
+        int taskId = in.readUnsignedShort();
         int fileId = in.readInt();
         String path = ProtocolIO.readString(in);
         long size = in.readLong();

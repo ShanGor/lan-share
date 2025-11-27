@@ -2,6 +2,8 @@ package com.lantransfer.ui.receiver;
 
 import com.lantransfer.core.service.TaskRegistry;
 import com.lantransfer.core.service.TransferReceiverService;
+import com.lantransfer.core.util.UserPreferences;
+import com.lantransfer.core.util.UserPreferences.ReceiverSettings;
 import com.lantransfer.ui.common.ProgressCellRenderer;
 import com.lantransfer.ui.common.TaskTableModel;
 
@@ -49,6 +51,10 @@ public class ReceiverFrame extends JFrame {
         JButton stopButton = new JButton("Stop Listening");
         stopButton.setEnabled(false);
 
+        ReceiverSettings prefs = UserPreferences.loadReceiverSettings();
+        portField.setText(Integer.toString(prefs.port()));
+        destField.setText(prefs.destination());
+
         gbc.gridx = 0; gbc.gridy = 0; form.add(portLabel, gbc);
         gbc.gridx = 1; gbc.gridy = 0; gbc.weightx = 1; form.add(portField, gbc);
         gbc.gridx = 0; gbc.gridy = 1; gbc.weightx = 0; form.add(destLabel, gbc);
@@ -89,6 +95,7 @@ public class ReceiverFrame extends JFrame {
                 portField.setEnabled(false);
                 browseButton.setEnabled(false);
                 statusLabel.setText("Status: Listening on port " + port);
+                UserPreferences.saveReceiverSettings(new ReceiverSettings(port, dest));
             } catch (NumberFormatException ex) {
                 JOptionPane.showMessageDialog(this, "Port must be a number.", "Validation", JOptionPane.WARNING_MESSAGE);
             } catch (InterruptedException ex) {

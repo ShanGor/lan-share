@@ -38,4 +38,5 @@ java -jar target/lan-transfer-0.1.0-SNAPSHOT-jar-with-dependencies.jar
 - Bitmap-based chunk tracking and resend on missing chunks; per-file MD5 validation and file-done signaling.
 - Simple retry/backoff for file-send-done and missing-chunk requests; bitmap persistence enables resume after restart.
 - Path traversal guarded by destination root check; graceful shutdown closes UDP/scheduler resources.
+- Remembers last-used sender (host/port/folder) and receiver (port/destination) settings across restarts via `~/.lan-transfer`.
 - Outstanding work: stronger reliability (sliding window/ACK), persistent task store, richer error surfacing/logging.

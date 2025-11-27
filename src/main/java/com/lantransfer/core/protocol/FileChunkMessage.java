@@ -4,7 +4,8 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 
-public record FileChunkMessage(String taskId, int fileId, byte[] chunkBytes) implements ProtocolMessage {
+public record FileChunkMessage(int taskId, int fileId, long chunkSeq, byte xorKey, byte[] body)
+        implements ProtocolMessage {
     @Override
     public ProtocolMessageType type() {
         return ProtocolMessageType.FILE_CHUNK;
@@ -12,17 +13,21 @@ public record FileChunkMessage(String taskId, int fileId, byte[] chunkBytes) imp
 
     @Override
     public void write(DataOutputStream out) throws IOException {
-        ProtocolIO.writeString(out, taskId);
+        out.writeShort(taskId & 0xFFFF);
         out.writeInt(fileId);
-        out.writeInt(chunkBytes.length);
-        out.write(chunkBytes);
+        out.writeLong(chunkSeq);
+        out.writeByte(xorKey);
+        out.writeShort(body.length);
+        out.write(body);
     }
 
     public static FileChunkMessage read(DataInputStream in) throws IOException {
-        String taskId = ProtocolIO.readString(in);
+        int taskId = in.readUnsignedShort();
         int fileId = in.readInt();
-        int len = in.readInt();
-        byte[] chunk = in.readNBytes(len);
-        return new FileChunkMessage(taskId, fileId, chunk);
+        long seq = in.readLong();
+        byte xor = in.readByte();
+        int len = in.readUnsignedShort();
+        byte[] body = in.readNBytes(len);
+        return new FileChunkMessage(taskId, fileId, seq, xor, body);
     }
 }

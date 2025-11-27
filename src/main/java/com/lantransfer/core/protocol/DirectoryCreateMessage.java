@@ -4,7 +4,7 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 
-public record DirectoryCreateMessage(String taskId, String relativePath) implements ProtocolMessage {
+public record DirectoryCreateMessage(int taskId, String relativePath) implements ProtocolMessage {
     @Override
     public ProtocolMessageType type() {
         return ProtocolMessageType.DIR_CREATE;
@@ -12,12 +12,12 @@ public record DirectoryCreateMessage(String taskId, String relativePath) impleme
 
     @Override
     public void write(DataOutputStream out) throws IOException {
-        ProtocolIO.writeString(out, taskId);
+        out.writeShort(taskId & 0xFFFF);
         ProtocolIO.writeString(out, relativePath);
     }
 
     public static DirectoryCreateMessage read(DataInputStream in) throws IOException {
-        String taskId = ProtocolIO.readString(in);
+        int taskId = in.readUnsignedShort();
         String path = ProtocolIO.readString(in);
         return new DirectoryCreateMessage(taskId, path);
     }

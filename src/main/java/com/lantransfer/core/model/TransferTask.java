@@ -3,11 +3,11 @@ package com.lantransfer.core.model;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.Objects;
-import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class TransferTask {
     private final String taskId;
+    private final int protocolTaskId;
     private final Path source;
     private final Path destination;
     private volatile TransferStatus status;
@@ -16,12 +16,9 @@ public class TransferTask {
     private final Instant createdAt;
     private volatile Instant updatedAt;
 
-    public TransferTask(Path source, Path destination, long totalBytes) {
-        this(UUID.randomUUID().toString(), source, destination, totalBytes);
-    }
-
-    public TransferTask(String taskId, Path source, Path destination, long totalBytes) {
-        this.taskId = Objects.requireNonNull(taskId, "taskId");
+    public TransferTask(int protocolTaskId, Path source, Path destination, long totalBytes) {
+        this.protocolTaskId = protocolTaskId & 0xFFFF;
+        this.taskId = String.format("%05d", this.protocolTaskId);
         this.source = Objects.requireNonNull(source, "source");
         this.destination = Objects.requireNonNull(destination, "destination");
         this.totalBytes = totalBytes;
@@ -32,6 +29,10 @@ public class TransferTask {
 
     public String getTaskId() {
         return taskId;
+    }
+
+    public int getProtocolTaskId() {
+        return protocolTaskId;
     }
 
     public Path getSource() {

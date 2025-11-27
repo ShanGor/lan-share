@@ -4,23 +4,23 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 
-public record FileSendDoneMessage(int taskId, int fileId, long totalChunks) implements ProtocolMessage {
+public record ChunkAckMessage(int taskId, int fileId, long chunkSeq) implements ProtocolMessage {
     @Override
     public ProtocolMessageType type() {
-        return ProtocolMessageType.FILE_SEND_DONE;
+        return ProtocolMessageType.CHUNK_ACK;
     }
 
     @Override
     public void write(DataOutputStream out) throws IOException {
         out.writeShort(taskId & 0xFFFF);
         out.writeInt(fileId);
-        out.writeLong(totalChunks);
+        out.writeLong(chunkSeq);
     }
 
-    public static FileSendDoneMessage read(DataInputStream in) throws IOException {
+    public static ChunkAckMessage read(DataInputStream in) throws IOException {
         int taskId = in.readUnsignedShort();
         int fileId = in.readInt();
-        long totalChunks = in.readLong();
-        return new FileSendDoneMessage(taskId, fileId, totalChunks);
+        long seq = in.readLong();
+        return new ChunkAckMessage(taskId, fileId, seq);
     }
 }
