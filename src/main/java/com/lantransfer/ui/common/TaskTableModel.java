@@ -5,11 +5,16 @@ import com.lantransfer.core.model.TransferTask;
 
 import javax.swing.table.AbstractTableModel;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public class TaskTableModel extends AbstractTableModel {
     private final List<TransferTask> tasks = new ArrayList<>();
-    private final String[] columns = {"Task ID", "Status", "Progress", "Transferred", "Total"};
+    private final String[] columns = {"Task ID", "Status", "Progress", "Speed (KB/s)", "Transferred", "Total"};
+    private final Map<String, Long> lastBytes = new HashMap<>();
+    private final Map<String, Long> lastTimes = new HashMap<>();
+    private final Map<String, Double> speeds = new HashMap<>();
 
     @Override
     public int getRowCount() {
@@ -29,8 +34,7 @@ public class TaskTableModel extends AbstractTableModel {
     @Override
     public Class<?> getColumnClass(int columnIndex) {
         return switch (columnIndex) {
-            case 2 -> Double.class;
-            case 3, 4 -> Long.class;
+            case 2, 3 -> Double.class;
             default -> String.class;
         };
     }
@@ -42,8 +46,9 @@ public class TaskTableModel extends AbstractTableModel {
             case 0 -> task.getTaskId();
             case 1 -> task.getStatus();
             case 2 -> progress(task);
-            case 3 -> formatBytes(task.getBytesTransferred());
-            case 4 -> formatBytes(task.getTotalBytes());
+            case 3 -> speed(task);
+            case 4 -> formatBytes(task.getBytesTransferred());
+            case 5 -> formatBytes(task.getTotalBytes());
             default -> "";
         };
     }
@@ -58,6 +63,9 @@ public class TaskTableModel extends AbstractTableModel {
 
     public void addTask(TransferTask task) {
         tasks.add(task);
+        lastBytes.put(task.getTaskId(), task.getBytesTransferred());
+        lastTimes.put(task.getTaskId(), System.currentTimeMillis());
+        speeds.put(task.getTaskId(), 0d);
         fireTableDataChanged();
     }
 
@@ -72,7 +80,28 @@ public class TaskTableModel extends AbstractTableModel {
     }
 
     public void refresh() {
+        long now = System.currentTimeMillis();
+        for (TransferTask task : tasks) {
+            String id = task.getTaskId();
+            long currentBytes = task.getBytesTransferred();
+            Long prevBytes = lastBytes.get(id);
+            Long prevTime = lastTimes.get(id);
+            if (prevBytes != null && prevTime != null) {
+                long deltaBytes = currentBytes - prevBytes;
+                long deltaTime = now - prevTime;
+                if (deltaTime > 0 && deltaBytes >= 0) {
+                    double kbps = (deltaBytes / 1024.0d) / (deltaTime / 1000.0d);
+                    speeds.put(id, kbps);
+                }
+            }
+            lastBytes.put(id, currentBytes);
+            lastTimes.put(id, now);
+        }
         fireTableDataChanged();
+    }
+
+    private double speed(TransferTask task) {
+        return speeds.getOrDefault(task.getTaskId(), 0d);
     }
 
     private String formatBytes(long value) {

@@ -40,12 +40,12 @@ Single-purpose LAN file transfer tool with GUI. Sender chooses a folder, Receive
   - Protocol task id: unsigned 16-bit number (2 bytes). Sender derives it from the low 16 bits of the current timestamp (retrying on collision). Every protocol message carries this task id.
   - File id: unsigned 32-bit number (4 bytes) assigned incrementally per file within a task.
   - Chunk sequence: unsigned 64-bit number (8 bytes) per file, starting at 0.
-  - Chunk header size: 15 bytes = taskId(2) + fileId(4) + chunkSeq(8) + xorKey(1) + bodySize(2). Body remains up to 1000 bytes, XOR’ed with the xor key; receiver applies the same XOR to recover data.
+  - Chunk header size: 15 bytes = taskId(2) + fileId(4) + chunkSeq(8) + xorKey(1) + bodySize(2). Body remains up to 1024 bytes, XOR’ed with the xor key; receiver applies the same XOR to recover data.
 - **Checksum rules**:
   - No per-chunk CRC32. Integrity is ensured by MD5 per file after full receipt; on failure receiver requests full-file resend.
 - **Resend behavior**:
   - Receiver maintains a bitmap file per transferring file on disk; 1 bit per chunk (1 = received, 0 = missing). Bitmap persists until file verified and is reused when resuming after restarts.
-  - Sender uses stop-and-wait per chunk: send a chunk, wait for the receiver’s ACK (taskId + fileId + chunkSeq), retransmit after timeout (configurable, limited retries), then move to the next chunk.
+  - Sender uses a sliding window (default 64 chunks per file in flight). Each chunk must receive an ACK (taskId + fileId + chunkSeq); as soon as the oldest chunk is ACKed, the next chunk enters the window. Retransmit unacked chunks after timeout (configurable, limited retries).
   - Receiver acknowledges each chunk via `CHUNK_ACK` message containing taskId(2) + fileId(4) + chunkSeq(8). Duplicate chunks are detected via the bitmap and re-ACKed without rewriting data.
   - After a file’s final chunk is ACKed, sender emits `FILE_SEND_DONE`. Receiver checks bitmap; if any chunks are still missing, it issues a `FILE_RESEND_REQUEST` listing the chunkSeq values required.
   - Receiver may request resend of a specific file; sender re-sends metadata and data for that file.
@@ -70,19 +70,20 @@ Message bodies use a simple binary framing; all multi-byte fields in big-endian.
 - `HEARTBEAT/ACK`: optional; used for reliability/keepalive (see Reliability).
 
 ## Reliability and Ordering (UDP)
-- Implement stop-and-wait acknowledgements:
-  - Each chunk must be ACKed (taskId + fileId + chunkSeq) before the sender transmits the next chunk; retransmit after a timeout (configurable) with capped retries.
-  - Receiver tracks missing chunk sequences via bitmap and requests retransmission if a `FILE_SEND_DONE` arrives before all chunks are ACKed.
+- Implement sliding-window acknowledgements:
+  - Up to 16 chunks per file may be in flight at once (default). Each chunk must receive an ACK (taskId + fileId + chunkSeq) before it leaves the window; when the oldest chunk is ACKed, the next chunk is transmitted.
+  - Retransmit unacked chunks after a timeout (configurable) with capped retries. Receiver tracks missing sequences via bitmap and requests retransmission if a `FILE_SEND_DONE` arrives before all chunks are ACKed.
 - Retransmission timeouts and max retries should be configurable (defaults reasonable for LAN).
 - Ensure in-order reassembly per file; drop duplicates.
 - Handle out-of-order delivery.
 - If retries exhausted for a file, mark the task as `Failed` and notify user.
 
 ## UI Requirements (Swing)
-- Sender main view: source folder picker, receiver host/port fields, Send button, task list with progress bars, status, and cancel control; detail pane showing current file, speed, ETA.
+- Sender main view: source folder picker, receiver host/port fields, Send button, task list with progress bars, status, and cancel control; detail pane showing current file, speed, ETA. Display live transfer speed per task (KB/s) based on recent data.
 - Receiver main view: listen port field, destination folder picker, Start/Stop Listening buttons, incoming offer dialog (accept/reject), task list with status/progress, detail pane with current file and errors.
 - Notifications: surface rejections, failures, checksum mismatches, and completed tasks.
 - Input validation: host/port required; show clear errors.
+- UI should adopt the platform’s look & feel (e.g., use `UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName())`) so controls match the host OS styling.
 
 ## Non-Functional Requirements
 - Performance: Aim for efficient LAN throughput with minimal overhead; allow tuning of chunk window size and timeouts.

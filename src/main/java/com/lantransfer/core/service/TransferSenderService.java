@@ -41,6 +41,7 @@ import java.util.logging.Logger;
 
 public class TransferSenderService implements AutoCloseable {
     private static final Logger log = Logger.getLogger(TransferSenderService.class.getName());
+    private static final int WINDOW_SIZE = 64;
     private static final int CHUNK_ACK_TIMEOUT_SECONDS = 2;
     private static final int MAX_CHUNK_RETRY = 5;
     private static final int FILE_DONE_TIMEOUT_SECONDS = 30;
@@ -153,34 +154,41 @@ public class TransferSenderService implements AutoCloseable {
     private void sendFileChunks(SenderContext ctx, int fileId, Path file, long totalChunks) throws Exception {
         try (FileInputStream fis = new FileInputStream(file.toFile())) {
             byte[] buffer = new byte[ChunkHeader.MAX_BODY_SIZE];
-            long seq = 0;
-            int read;
-            while ((read = fis.read(buffer)) != -1) {
-                byte[] plain = Arrays.copyOf(buffer, read);
-                sendChunkAndAwaitAck(ctx, fileId, seq, plain);
-                ctx.task.addBytesTransferred(read);
-                seq++;
-            }
-            if (seq != totalChunks) {
-                log.warning("Chunk count mismatch for " + file + ": expected " + totalChunks + ", sent " + seq);
+            long nextSeqToSend = 0;
+            long nextSeqToAck = 0;
+            boolean eof = false;
+            while (nextSeqToAck < totalChunks) {
+                while (!eof && nextSeqToSend - nextSeqToAck < WINDOW_SIZE && nextSeqToSend < totalChunks) {
+                    int read = fis.read(buffer);
+                    if (read == -1) {
+                        eof = true;
+                        break;
+                    }
+                    byte[] plain = Arrays.copyOf(buffer, read);
+                    enqueueChunk(ctx, fileId, nextSeqToSend, plain);
+                    ctx.task.addBytesTransferred(read);
+                    nextSeqToSend++;
+                }
+                ChunkKey waitKey = new ChunkKey(fileId, nextSeqToAck);
+                CompletableFuture<Void> future = ctx.chunkAckFutures.get(waitKey);
+                if (future == null) {
+                    nextSeqToAck++;
+                    continue;
+                }
+                future.get(CHUNK_ACK_TIMEOUT_SECONDS * (MAX_CHUNK_RETRY + 1L), TimeUnit.SECONDS);
+                ctx.chunkAckFutures.remove(waitKey);
+                nextSeqToAck++;
             }
         }
     }
 
-    private void sendChunkAndAwaitAck(SenderContext ctx, int fileId, long seq, byte[] plain) throws Exception {
+    private void enqueueChunk(SenderContext ctx, int fileId, long seq, byte[] plain) throws IOException {
         ChunkKey key = new ChunkKey(fileId, seq);
         CompletableFuture<Void> ackFuture = new CompletableFuture<>();
         ctx.chunkAckFutures.put(key, ackFuture);
         ctx.inflightChunks.put(key, new ChunkInFlight(plain));
         transmitChunk(ctx, fileId, seq, plain);
         scheduleChunkRetry(ctx, key, 0);
-        try {
-            ackFuture.get(CHUNK_ACK_TIMEOUT_SECONDS * (MAX_CHUNK_RETRY + 1L), TimeUnit.SECONDS);
-        } finally {
-            ctx.chunkAckFutures.remove(key);
-            ctx.cancelChunkTimeout(key);
-            ctx.inflightChunks.remove(key);
-        }
     }
 
     private void transmitChunk(SenderContext ctx, int fileId, long seq, byte[] plain) throws IOException {
@@ -202,6 +210,9 @@ public class TransferSenderService implements AutoCloseable {
             return;
         }
         ScheduledFuture<?> future = scheduler.schedule(() -> {
+            if (!ctx.chunkAckFutures.containsKey(key)) {
+                return;
+            }
             ChunkInFlight inflight = ctx.inflightChunks.get(key);
             if (inflight == null) {
                 return;
@@ -264,8 +275,10 @@ public class TransferSenderService implements AutoCloseable {
             return;
         }
         ChunkKey key = new ChunkKey(msg.fileId(), msg.chunkSeq());
-        CompletableFuture<Void> future = ctx.chunkAckFutures.get(key);
+        CompletableFuture<Void> future = ctx.chunkAckFutures.remove(key);
         if (future != null) {
+            ctx.cancelChunkTimeout(key);
+            ctx.inflightChunks.remove(key);
             future.complete(null);
         }
     }

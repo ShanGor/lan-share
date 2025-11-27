@@ -28,7 +28,9 @@ import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.BitSet;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -176,6 +178,17 @@ public class TransferReceiverService implements AutoCloseable {
             log.log(Level.WARNING, "Failed to write chunk seq " + seq, e);
         }
         sendUnchecked(sender, new ChunkAckMessage(msg.taskId(), msg.fileId(), msg.chunkSeq()));
+        maybeRequestMissingChunks(sender, ctx, rf, msg.taskId(), msg.fileId(), seq);
+    }
+
+    private void maybeRequestMissingChunks(InetSocketAddress sender, ReceiverContext ctx, ReceiverFile rf,
+                                           int taskId, int fileId, long seq) {
+        rf.updateHighest(seq);
+        List<Long> missingSeqs = rf.computeMissingBefore(seq);
+        if (!missingSeqs.isEmpty()) {
+            long[] arr = missingSeqs.stream().mapToLong(Long::longValue).toArray();
+            sendUnchecked(sender, new FileResendRequestMessage(taskId, fileId, arr));
+        }
     }
 
     private void onFileSendDone(InetSocketAddress sender, FileSendDoneMessage msg) {
@@ -274,6 +287,8 @@ public class TransferReceiverService implements AutoCloseable {
         final FileChunkBitmap bitmap;
         final long totalChunks;
         volatile boolean completed = false;
+        private volatile long highestSeqSeen = -1;
+        private volatile long contiguousSeq = -1;
 
         ReceiverFile(Path target, Path tempFile, long size, String expectedMd5, FileChunkBitmap bitmap, long totalChunks) {
             this.target = target;
@@ -286,6 +301,27 @@ public class TransferReceiverService implements AutoCloseable {
 
         Path bitmapPath() {
             return tempFile.resolveSibling(tempFile.getFileName() + ".bitmap");
+        }
+
+        synchronized void updateHighest(long seq) {
+            if (seq > highestSeqSeen) {
+                highestSeqSeen = seq;
+            }
+            while (contiguousSeq + 1 <= highestSeqSeen &&
+                    bitmap.isReceived((int) (contiguousSeq + 1))) {
+                contiguousSeq++;
+            }
+        }
+
+        synchronized List<Long> computeMissingBefore(long seq) {
+            long expected = contiguousSeq + 1;
+            List<Long> missing = new ArrayList<>();
+            for (long s = expected; s < seq; s++) {
+                if (!bitmap.isReceived((int) s)) {
+                    missing.add(s);
+                }
+            }
+            return missing;
         }
     }
 

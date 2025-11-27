@@ -3,7 +3,7 @@ package com.lantransfer.core.protocol;
 import java.nio.ByteBuffer;
 
 public class ChunkHeader {
-    public static final int MAX_BODY_SIZE = 1000;
+    public static final int MAX_BODY_SIZE = 1024;
     public static final int HEADER_SIZE = 2 + 4 + 8 + 1 + 2;
     public static final int MAX_CHUNK_SIZE = HEADER_SIZE + MAX_BODY_SIZE;
 
