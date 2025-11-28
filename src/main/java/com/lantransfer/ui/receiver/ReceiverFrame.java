@@ -70,7 +70,40 @@ public class ReceiverFrame extends JFrame {
         table.getColumnModel().getColumn(2).setCellRenderer(new ProgressCellRenderer());
         add(new JScrollPane(table), BorderLayout.CENTER);
 
-        new Timer(1000, e -> tableModel.refresh()).start();
+        // Add detail panel to show current file
+        JPanel detailPanel = new JPanel();
+        detailPanel.setBorder(javax.swing.BorderFactory.createTitledBorder("Current File"));
+        JLabel currentFileLabel = new JLabel(" ");
+        detailPanel.add(currentFileLabel);
+        add(detailPanel, BorderLayout.SOUTH);
+
+        new Timer(1000, e -> {
+            tableModel.refresh();
+            // Update current file display for active task
+            String currentFile = "";
+            // Look for any active/in-progress task
+            for (int i = 0; i < tableModel.getRowCount(); i++) {
+                String taskId = (String) tableModel.getValueAt(i, 0);
+                String status = tableModel.getValueAt(i, 1).toString();
+                if (status.equals("IN_PROGRESS") || status.equals("RESENDING")) {
+                    currentFile = tableModel.getCurrentFile(taskId);
+                    if (currentFile != null && !currentFile.isEmpty()) {
+                        break; // Use first active task found
+                    }
+                }
+            }
+            // If no active task file found, try selected row as fallback
+            if ((currentFile == null || currentFile.isEmpty()) && table.getSelectedRow() >= 0) {
+                int selectedRow = table.getSelectedRow();
+                String taskId = (String) tableModel.getValueAt(selectedRow, 0);
+                currentFile = tableModel.getCurrentFile(taskId);
+            }
+            if (currentFile != null && !currentFile.isEmpty()) {
+                currentFileLabel.setText(currentFile);
+            } else {
+                currentFileLabel.setText(" ");
+            }
+        }).start();
 
         browseButton.addActionListener(e -> {
             JFileChooser chooser = new JFileChooser();

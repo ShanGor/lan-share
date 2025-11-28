@@ -52,6 +52,7 @@ public final class ProtocolIO {
                 case CHUNK_ACK -> ChunkAckMessage.read(in);
                 case CHUNK_REQUEST -> ChunkRequestMessage.read(in);
                 case DIR_CREATE -> DirectoryCreateMessage.read(in);
+                case META_ACK -> MetaAckMessage.read(in);
                 case HEARTBEAT_ACK -> HeartbeatAckMessage.read(in);
             };
         }

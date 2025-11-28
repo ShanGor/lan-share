@@ -85,6 +85,7 @@ Message bodies use a simple binary framing; all multi-byte fields in big-endian.
 - Notifications: surface rejections, failures, checksum mismatches, and completed tasks.
 - Input validation: host/port required; show clear errors.
 - UI should adopt the platform’s look & feel (e.g., use `UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName())`) so controls match the host OS styling.
+- Show current processing file path(s): Both sender and receiver UIs should display the full path of the file currently being processed in the details pane.
 
 ## Non-Functional Requirements
 - Performance: Aim for efficient LAN throughput with minimal overhead; allow tuning of chunk window size and timeouts.

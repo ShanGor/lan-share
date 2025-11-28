@@ -12,5 +12,6 @@ public enum ProtocolMessageType {
     CHUNK_ACK,
     CHUNK_REQUEST,
     DIR_CREATE,
+    META_ACK,
     HEARTBEAT_ACK
 }

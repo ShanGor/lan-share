@@ -11,6 +11,7 @@ import com.lantransfer.core.protocol.DirectoryCreateMessage;
 import com.lantransfer.core.protocol.FileChunkMessage;
 import com.lantransfer.core.protocol.FileCompleteMessage;
 import com.lantransfer.core.protocol.FileMetaMessage;
+import com.lantransfer.core.protocol.MetaAckMessage;
 import com.lantransfer.core.protocol.ProtocolIO;
 import com.lantransfer.core.protocol.ProtocolMessage;
 import com.lantransfer.core.protocol.TaskCancelMessage;
@@ -42,7 +43,8 @@ import java.util.logging.Logger;
 
 public class TransferReceiverService implements AutoCloseable {
     private static final Logger log = Logger.getLogger(TransferReceiverService.class.getName());
-    private static final int REQUEST_RETRY_MS = 2000;
+    private static final int REQUEST_RETRY_MS = 500; // Reduced from 2000ms to improve performance
+    private static final int REQUEST_BATCH_SIZE = 32; // Increased from 8 to improve throughput
     private final UdpEndpoint endpoint = new UdpEndpoint();
     private final TaskRegistry taskRegistry;
     private final TaskTableModel tableModel;
@@ -118,8 +120,14 @@ public class TransferReceiverService implements AutoCloseable {
             log.warning("Rejected path outside destination: " + target);
             return;
         }
+
+        // Send META_ACK to acknowledge receipt of metadata
+        sendUnchecked(sender, new MetaAckMessage(msg.taskId(), msg.fileId()));
+
         if (msg.entryType() == 'D') {
             Files.createDirectories(target);
+            // Update current file path for UI
+            ctx.currentFilePath = target.toString();
             sendUnchecked(sender, new FileCompleteMessage(msg.taskId(), msg.fileId(), true));
             ctx.completedFiles++;
             if (ctx.completedFiles >= ctx.expectedFiles) {
@@ -137,6 +145,8 @@ public class TransferReceiverService implements AutoCloseable {
         FileChunkBitmap bitmap = new FileChunkBitmap(tempFile.resolveSibling(tempFile.getFileName() + ".bitmap"), (int) chunkCount);
         ReceiverFile rf = new ReceiverFile(target, tempFile, msg.size(), msg.md5(), bitmap, chunkCount);
         ctx.files.put(msg.fileId(), rf);
+        // Update current file path for UI
+        ctx.currentFilePath = target.toString();
         scheduleChunkRequest(ctx, sender, msg.taskId(), msg.fileId(), 0);
     }
 
@@ -145,6 +155,10 @@ public class TransferReceiverService implements AutoCloseable {
         if (ctx == null) return;
         ReceiverFile rf = ctx.files.get(msg.fileId());
         if (rf == null) return;
+
+        // Update current file path for UI display
+        ctx.currentFilePath = rf.target.toString();
+
         if (ctx.task.getStatus() == TransferStatus.RESENDING) {
             ctx.task.setStatus(TransferStatus.IN_PROGRESS);
         }
@@ -205,7 +219,7 @@ public class TransferReceiverService implements AutoCloseable {
                 if (f != null) f.cancel(false);
                 return;
             }
-            List<Long> batch = nextBatchMissing(rfile, 8);
+            List<Long> batch = nextBatchMissing(rfile, REQUEST_BATCH_SIZE);
             for (long m : batch) {
                 sendUnchecked(sender, new ChunkRequestMessage(taskId, fileId, m));
             }
@@ -214,28 +228,36 @@ public class TransferReceiverService implements AutoCloseable {
     }
 
     private void verifyAndComplete(InetSocketAddress sender, int taskId, int fileId, ReceiverFile rf, ReceiverContext ctx) {
-        try {
-            if (!Files.exists(rf.tempFile)) {
-                sendUnchecked(sender, new FileCompleteMessage(taskId, fileId, false));
-                ctx.task.setStatus(TransferStatus.RESENDING);
-                return;
-            }
-            String md5 = new ChecksumService().md5(rf.tempFile);
-            boolean ok = md5.equalsIgnoreCase(rf.expectedMd5);
-            sendUnchecked(sender, new FileCompleteMessage(taskId, fileId, ok));
-            if (ok) {
-                Files.move(rf.tempFile, rf.target, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-                Files.deleteIfExists(rf.bitmapPath());
-                ctx.completedFiles++;
-                if (ctx.completedFiles >= ctx.expectedFiles) {
-                    ctx.task.setStatus(TransferStatus.COMPLETED);
-                    sendUnchecked(sender, new TaskCompleteMessage(taskId));
+        synchronized (rf.writeLock) { // Ensure only one thread processes the verification and completion
+            try {
+                if (!Files.exists(rf.tempFile)) {
+                    sendUnchecked(sender, new FileCompleteMessage(taskId, fileId, false));
+                    ctx.task.setStatus(TransferStatus.RESENDING);
+                    return;
                 }
-            } else {
-                ctx.task.setStatus(TransferStatus.RESENDING);
+                String md5 = new ChecksumService().md5(rf.tempFile);
+                boolean ok = md5.equalsIgnoreCase(rf.expectedMd5);
+                sendUnchecked(sender, new FileCompleteMessage(taskId, fileId, ok));
+                if (ok) {
+                    // Try to move the file, with retry in case of file locking issues on Windows
+                    boolean moved = moveFileWithRetry(rf.tempFile, rf.target);
+                    if (moved) {
+                        Files.deleteIfExists(rf.bitmapPath());
+                        ctx.completedFiles++;
+                        if (ctx.completedFiles >= ctx.expectedFiles) {
+                            ctx.task.setStatus(TransferStatus.COMPLETED);
+                            sendUnchecked(sender, new TaskCompleteMessage(taskId));
+                        }
+                    } else {
+                        log.log(Level.WARNING, "Failed to move file after retries: " + rf.tempFile + " -> " + rf.target);
+                        ctx.task.setStatus(TransferStatus.FAILED);
+                    }
+                } else {
+                    ctx.task.setStatus(TransferStatus.RESENDING);
+                }
+            } catch (IOException e) {
+                log.log(Level.WARNING, "Failed to verify file", e);
             }
-        } catch (IOException e) {
-            log.log(Level.WARNING, "Failed to verify file", e);
         }
     }
 
@@ -282,6 +304,31 @@ public class TransferReceiverService implements AutoCloseable {
         return result;
     }
 
+    private boolean moveFileWithRetry(Path source, Path target) {
+        int maxRetries = 5;
+        int retryDelayMs = 100; // 100ms between retries
+
+        for (int i = 0; i < maxRetries; i++) {
+            try {
+                Files.move(source, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                return true; // Success
+            } catch (IOException e) {
+                if (i == maxRetries - 1) { // Last attempt
+                    log.log(Level.WARNING, "Failed to move file after " + maxRetries + " attempts: " + source + " -> " + target, e);
+                    return false;
+                }
+                // Wait before retry
+                try {
+                    Thread.sleep(retryDelayMs);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+        }
+        return false;
+    }
+
     private static class ReceiverContext {
         final TransferTask task;
         final InetSocketAddress sender;
@@ -290,6 +337,7 @@ public class TransferReceiverService implements AutoCloseable {
         volatile int completedFiles = 0;
         final Map<ChunkRequestKey, ScheduledFuture<?>> requestFutures = new ConcurrentHashMap<>();
         volatile long lastUiUpdateNanos = System.nanoTime();
+        volatile String currentFilePath = "";
 
         ReceiverContext(TransferTask task, InetSocketAddress sender, int expectedFiles) {
             this.task = task;
@@ -300,8 +348,10 @@ public class TransferReceiverService implements AutoCloseable {
         void maybeRefreshUI(TaskTableModel model) {
             if (model == null) return;
             long now = System.nanoTime();
-            if (now - lastUiUpdateNanos > 500_000_000L) { // 0.5s
+            if (now - lastUiUpdateNanos > 200_000_000L) { // 0.2s - more frequent updates
                 lastUiUpdateNanos = now;
+                // Update current file path in the UI
+                model.setCurrentFile(String.format("%05d", task.getProtocolTaskId()), currentFilePath);
                 javax.swing.SwingUtilities.invokeLater(model::refresh);
             }
         }

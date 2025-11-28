@@ -15,6 +15,7 @@ public class TaskTableModel extends AbstractTableModel {
     private final Map<String, Long> lastBytes = new HashMap<>();
     private final Map<String, Long> lastTimes = new HashMap<>();
     private final Map<String, Double> speeds = new HashMap<>();
+    private final Map<String, String> currentFileMap = new HashMap<>(); // Maps task ID to current file
 
     @Override
     public int getRowCount() {
@@ -58,7 +59,8 @@ public class TaskTableModel extends AbstractTableModel {
         if (total <= 0) {
             return 0d;
         }
-        return (task.getBytesTransferred() * 100.0d) / total;
+        double progress = (task.getBytesTransferred() * 100.0d) / total;
+        return Math.min(progress, 100.0d); // Cap at 100%
     }
 
     public void addTask(TransferTask task) {
@@ -102,6 +104,14 @@ public class TaskTableModel extends AbstractTableModel {
 
     private double speed(TransferTask task) {
         return speeds.getOrDefault(task.getTaskId(), 0d);
+    }
+
+    public void setCurrentFile(String taskId, String filePath) {
+        currentFileMap.put(taskId, filePath);
+    }
+
+    public String getCurrentFile(String taskId) {
+        return currentFileMap.get(taskId);
     }
 
     private String formatBytes(long value) {
