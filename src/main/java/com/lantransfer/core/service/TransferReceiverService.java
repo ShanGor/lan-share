@@ -5,9 +5,8 @@ import com.lantransfer.core.model.TransferStatus;
 import com.lantransfer.core.model.TransferTask;
 import com.lantransfer.core.net.UdpEndpoint;
 import com.lantransfer.core.protocol.ChunkAckMessage;
+import com.lantransfer.core.protocol.ChunkAckMessage.AckRange;
 import com.lantransfer.core.protocol.ChunkHeader;
-import com.lantransfer.core.protocol.ChunkRequestMessage;
-import com.lantransfer.core.protocol.DirectoryCreateMessage;
 import com.lantransfer.core.protocol.FileChunkMessage;
 import com.lantransfer.core.protocol.FileCompleteMessage;
 import com.lantransfer.core.protocol.FileMetaMessage;
@@ -23,10 +22,13 @@ import com.lantransfer.ui.common.TaskTableModel;
 import javax.swing.JOptionPane;
 import javax.swing.SwingUtilities;
 import java.io.IOException;
-import java.io.RandomAccessFile;
+import java.nio.channels.ClosedChannelException;
 import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.List;
@@ -35,21 +37,16 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 public class TransferReceiverService implements AutoCloseable {
     private static final Logger log = Logger.getLogger(TransferReceiverService.class.getName());
-    private static final int REQUEST_RETRY_MS = 500; // Reduced from 2000ms to improve performance
-    private static final int REQUEST_BATCH_SIZE = 32; // Increased from 8 to improve throughput
+    private static final int MAX_ACK_RANGES = 4;
     private final UdpEndpoint endpoint = new UdpEndpoint();
     private final TaskRegistry taskRegistry;
     private final TaskTableModel tableModel;
     private final ExecutorService workerPool = Executors.newFixedThreadPool(Math.max(2, Runtime.getRuntime().availableProcessors() / 2));
-    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
     private final Map<Integer, ReceiverContext> contexts = new ConcurrentHashMap<>();
     private Path destinationRoot;
 
@@ -133,6 +130,9 @@ public class TransferReceiverService implements AutoCloseable {
             if (ctx.completedFiles >= ctx.expectedFiles) {
                 ctx.task.setStatus(TransferStatus.COMPLETED);
                 sendUnchecked(sender, new TaskCompleteMessage(msg.taskId()));
+                if (contexts.remove(msg.taskId(), ctx)) {
+                    ctx.cleanup();
+                }
             }
             return;
         }
@@ -147,7 +147,6 @@ public class TransferReceiverService implements AutoCloseable {
         ctx.files.put(msg.fileId(), rf);
         // Update current file path for UI
         ctx.currentFilePath = target.toString();
-        scheduleChunkRequest(ctx, sender, msg.taskId(), msg.fileId(), 0);
     }
 
     private void onFileChunk(InetSocketAddress sender, FileChunkMessage msg) {
@@ -164,7 +163,12 @@ public class TransferReceiverService implements AutoCloseable {
         }
         int index = (int) msg.chunkSeq();
         if (rf.isAcked(index)) {
-            sendUnchecked(sender, new ChunkAckMessage(msg.taskId(), msg.fileId(), msg.chunkSeq()));
+            sendAck(sender, rf, msg.taskId(), msg.fileId(), index);
+            return;
+        }
+        if (rf.isFinalizing() || rf.isFinalized()) {
+            log.fine("Ignoring chunk " + index + " for finalized fileId " + msg.fileId());
+            sendAck(sender, rf, msg.taskId(), msg.fileId(), index);
             return;
         }
         byte[] decoded = xor(msg.body(), msg.xorKey());
@@ -173,90 +177,76 @@ public class TransferReceiverService implements AutoCloseable {
 
     private void writeChunkAndAck(InetSocketAddress sender, FileChunkMessage msg, ReceiverContext ctx, ReceiverFile rf, byte[] decoded, int index) {
         long offset = msg.chunkSeq() * ChunkHeader.MAX_BODY_SIZE;
-        synchronized (rf.writeLock) {
-            try (RandomAccessFile raf = new RandomAccessFile(rf.tempFile.toFile(), "rw")) {
-                raf.seek(offset);
-                raf.write(decoded);
-                raf.getFD().sync();
-                rf.markReceived(index);
-                ctx.task.addBytesTransferred(decoded.length);
-                ctx.maybeRefreshUI(tableModel);
-            } catch (IOException e) {
-                log.log(Level.WARNING, "Write failed for chunk " + msg.chunkSeq(), e);
-            }
+        boolean wrote = false;
+        try {
+            rf.writeChunk(offset, decoded);
+            rf.markReceived(index);
+            ctx.task.addBytesTransferred(decoded.length);
+            ctx.maybeRefreshUI(tableModel);
+            wrote = true;
+        } catch (ClosedChannelException e) {
+            log.log(Level.FINE, "Channel closed while writing chunk " + msg.chunkSeq() + ", ignoring duplicate");
+        } catch (IOException e) {
+            log.log(Level.WARNING, "Write failed for chunk " + msg.chunkSeq(), e);
         }
-        sendUnchecked(sender, new ChunkAckMessage(msg.taskId(), msg.fileId(), msg.chunkSeq()));
-        if (rf.allWritten()) {
-            verifyAndComplete(sender, msg.taskId(), msg.fileId(), rf, ctx);
-        } else {
-            scheduleChunkRequest(ctx, sender, msg.taskId(), msg.fileId(), nextMissing(rf));
-        }
-    }
-
-    private long nextMissing(ReceiverFile rf) {
-        BitSet missing = rf.missingAcked();
-        int next = missing.nextSetBit(0);
-        return next >= 0 ? next : rf.totalChunks; // if none, return totalChunks
-    }
-
-    private void scheduleChunkRequest(ReceiverContext ctx, InetSocketAddress sender, int taskId, int fileId, long seq) {
-        ReceiverFile rf = ctx.files.get(fileId);
-        if (rf == null || seq >= rf.totalChunks || rf.allWritten()) return;
-        ChunkRequestKey key = new ChunkRequestKey(taskId, fileId);
-        ScheduledFuture<?> existing = ctx.requestFutures.get(key);
-        if (existing != null && !existing.isCancelled()) {
+        if (!wrote) {
+            ctx.task.setStatus(TransferStatus.RESENDING);
             return;
         }
-        ScheduledFuture<?> future = scheduler.scheduleWithFixedDelay(() -> {
-            ReceiverFile rfile = ctx.files.get(fileId);
-            if (rfile == null) {
-                ScheduledFuture<?> f = ctx.requestFutures.remove(key);
-                if (f != null) f.cancel(false);
-                return;
-            }
-            if (rfile.allWritten()) {
-                ScheduledFuture<?> f = ctx.requestFutures.remove(key);
-                if (f != null) f.cancel(false);
-                return;
-            }
-            List<Long> batch = nextBatchMissing(rfile, REQUEST_BATCH_SIZE);
-            for (long m : batch) {
-                sendUnchecked(sender, new ChunkRequestMessage(taskId, fileId, m));
-            }
-        }, 0, REQUEST_RETRY_MS, TimeUnit.MILLISECONDS);
-        ctx.requestFutures.put(key, future);
+        sendAck(sender, rf, msg.taskId(), msg.fileId(), index);
+        if (rf.allWritten() && rf.beginFinalize()) {
+            verifyAndComplete(sender, msg.taskId(), msg.fileId(), rf, ctx);
+        }
+    }
+
+    private void sendAck(InetSocketAddress sender, ReceiverFile rf, int taskId, int fileId, int focusIndex) {
+        List<AckRange> ranges = rf.ackRangesFor(focusIndex, MAX_ACK_RANGES);
+        sendUnchecked(sender, new ChunkAckMessage(taskId, fileId, ranges));
     }
 
     private void verifyAndComplete(InetSocketAddress sender, int taskId, int fileId, ReceiverFile rf, ReceiverContext ctx) {
-        synchronized (rf.writeLock) { // Ensure only one thread processes the verification and completion
-            try {
-                if (!Files.exists(rf.tempFile)) {
-                    sendUnchecked(sender, new FileCompleteMessage(taskId, fileId, false));
-                    ctx.task.setStatus(TransferStatus.RESENDING);
-                    return;
-                }
-                String md5 = new ChecksumService().md5(rf.tempFile);
-                boolean ok = md5.equalsIgnoreCase(rf.expectedMd5);
-                sendUnchecked(sender, new FileCompleteMessage(taskId, fileId, ok));
-                if (ok) {
-                    // Try to move the file, with retry in case of file locking issues on Windows
-                    boolean moved = moveFileWithRetry(rf.tempFile, rf.target);
-                    if (moved) {
-                        Files.deleteIfExists(rf.bitmapPath());
-                        ctx.completedFiles++;
-                        if (ctx.completedFiles >= ctx.expectedFiles) {
-                            ctx.task.setStatus(TransferStatus.COMPLETED);
-                            sendUnchecked(sender, new TaskCompleteMessage(taskId));
+        try {
+            rf.forceWrites();
+        } catch (IOException e) {
+            log.log(Level.FINE, "Failed to flush writes before verification for " + rf.tempFile, e);
+        }
+        try {
+            if (!Files.exists(rf.tempFile)) {
+                sendUnchecked(sender, new FileCompleteMessage(taskId, fileId, false));
+                ctx.task.setStatus(TransferStatus.RESENDING);
+                return;
+            }
+            String md5 = new ChecksumService().md5(rf.tempFile);
+            boolean ok = md5.equalsIgnoreCase(rf.expectedMd5);
+            sendUnchecked(sender, new FileCompleteMessage(taskId, fileId, ok));
+            if (ok) {
+                boolean moved = moveFileWithRetry(rf.tempFile, rf.target);
+                if (moved) {
+                    Files.deleteIfExists(rf.bitmapPath());
+                    ctx.completedFiles++;
+                    if (ctx.completedFiles >= ctx.expectedFiles) {
+                        ctx.task.setStatus(TransferStatus.COMPLETED);
+                        sendUnchecked(sender, new TaskCompleteMessage(taskId));
+                        if (contexts.remove(taskId, ctx)) {
+                            ctx.cleanup();
                         }
-                    } else {
-                        log.log(Level.WARNING, "Failed to move file after retries: " + rf.tempFile + " -> " + rf.target);
-                        ctx.task.setStatus(TransferStatus.FAILED);
                     }
                 } else {
-                    ctx.task.setStatus(TransferStatus.RESENDING);
+                    log.log(Level.WARNING, "Failed to move file after retries: " + rf.tempFile + " -> " + rf.target);
+                    ctx.task.setStatus(TransferStatus.FAILED);
                 }
+            } else {
+                ctx.task.setStatus(TransferStatus.RESENDING);
+            }
+        } catch (IOException e) {
+            log.log(Level.WARNING, "Failed to verify file", e);
+        } finally {
+            ctx.files.remove(fileId);
+            rf.markFinalized();
+            try {
+                rf.closeChannel();
             } catch (IOException e) {
-                log.log(Level.WARNING, "Failed to verify file", e);
+                log.log(Level.FINE, "Failed to close channel after verification for " + rf.tempFile, e);
             }
         }
     }
@@ -265,6 +255,7 @@ public class TransferReceiverService implements AutoCloseable {
         ReceiverContext ctx = contexts.remove(msg.taskId());
         if (ctx != null) {
             ctx.task.setStatus(TransferStatus.CANCELED);
+            ctx.cleanup();
         }
     }
 
@@ -287,21 +278,9 @@ public class TransferReceiverService implements AutoCloseable {
     @Override
     public void close() {
         endpoint.close();
+        contexts.values().forEach(ReceiverContext::cleanup);
+        contexts.clear();
         workerPool.shutdownNow();
-        scheduler.shutdownNow();
-    }
-
-    private record ChunkRequestKey(int taskId, int fileId) {}
-
-    private List<Long> nextBatchMissing(ReceiverFile rf, int batchSize) {
-        BitSet missing = rf.missingAcked();
-        List<Long> result = new ArrayList<>(batchSize);
-        int next = missing.nextSetBit(0);
-        while (next >= 0 && result.size() < batchSize) {
-            result.add((long) next);
-            next = missing.nextSetBit(next + 1);
-        }
-        return result;
     }
 
     private boolean moveFileWithRetry(Path source, Path target) {
@@ -335,7 +314,6 @@ public class TransferReceiverService implements AutoCloseable {
         final Map<Integer, ReceiverFile> files = new ConcurrentHashMap<>();
         final int expectedFiles;
         volatile int completedFiles = 0;
-        final Map<ChunkRequestKey, ScheduledFuture<?>> requestFutures = new ConcurrentHashMap<>();
         volatile long lastUiUpdateNanos = System.nanoTime();
         volatile String currentFilePath = "";
 
@@ -355,6 +333,11 @@ public class TransferReceiverService implements AutoCloseable {
                 javax.swing.SwingUtilities.invokeLater(model::refresh);
             }
         }
+
+        void cleanup() {
+            files.values().forEach(ReceiverFile::closeQuietly);
+            files.clear();
+        }
     }
 
     private static class ReceiverFile {
@@ -366,18 +349,33 @@ public class TransferReceiverService implements AutoCloseable {
         final long totalChunks;
         final Object writeLock = new Object();
         final BitSet acked = new BitSet();
+        final FileChannel channel;
+        volatile boolean closed = false;
+        int highestContiguous = -1;
+        volatile boolean finalizing = false;
+        volatile boolean finalized = false;
 
-        ReceiverFile(Path target, Path tempFile, long size, String expectedMd5, FileChunkBitmap bitmap, long totalChunks) {
+        ReceiverFile(Path target, Path tempFile, long size, String expectedMd5, FileChunkBitmap bitmap, long totalChunks) throws IOException {
             this.target = target;
             this.tempFile = tempFile;
             this.size = size;
             this.expectedMd5 = expectedMd5;
             this.bitmap = bitmap;
             this.totalChunks = totalChunks;
+            this.channel = FileChannel.open(tempFile, StandardOpenOption.WRITE, StandardOpenOption.READ);
         }
 
         Path bitmapPath() {
             return tempFile.resolveSibling(tempFile.getFileName() + ".bitmap");
+        }
+
+        void writeChunk(long offset, byte[] data) throws IOException {
+            synchronized (writeLock) {
+                if (finalizing || closed) {
+                    throw new ClosedChannelException();
+                }
+                channel.write(ByteBuffer.wrap(data), offset);
+            }
         }
 
         synchronized boolean isAcked(int index) {
@@ -387,17 +385,109 @@ public class TransferReceiverService implements AutoCloseable {
         synchronized void markReceived(int index) throws IOException {
             acked.set(index);
             bitmap.markReceived(index);
+            updateHighestContiguous();
         }
 
         synchronized boolean allWritten() {
             return bitmap.allReceived();
         }
 
-        synchronized BitSet missingAcked() {
-            BitSet missing = new BitSet((int) totalChunks);
-            missing.set(0, (int) totalChunks);
-            missing.andNot(acked);
-            return missing;
+        void forceWrites() throws IOException {
+            synchronized (writeLock) {
+                if (finalizing || closed) {
+                    return;
+                }
+                channel.force(false);
+            }
         }
+
+        void closeChannel() throws IOException {
+            synchronized (writeLock) {
+                if (closed) {
+                    return;
+                }
+                closed = true;
+            }
+            channel.close();
+        }
+
+        void closeQuietly() {
+            try {
+                closeChannel();
+            } catch (IOException e) {
+                log.log(Level.FINE, "Failed to close receiver file channel for " + tempFile, e);
+            }
+        }
+
+        boolean beginFinalize() {
+            synchronized (writeLock) {
+                if (finalizing || finalized) {
+                    return false;
+                }
+                finalizing = true;
+                return true;
+            }
+        }
+
+        boolean isFinalizing() {
+            return finalizing;
+        }
+
+        boolean isFinalized() {
+            return finalized;
+        }
+
+        void markFinalized() {
+            synchronized (writeLock) {
+                finalized = true;
+                finalizing = false;
+            }
+        }
+
+        List<AckRange> ackRangesFor(int focusIndex, int maxRanges) {
+            List<AckRange> ranges = new ArrayList<>();
+            synchronized (writeLock) {
+                if (highestContiguous >= 0) {
+                    ranges.add(new AckRange(0, highestContiguous));
+                }
+                if (focusIndex > highestContiguous) {
+                    int start = expandBackward(focusIndex);
+                    int end = expandForward(focusIndex);
+                    ranges.add(new AckRange(start, end));
+                }
+                if (ranges.isEmpty()) {
+                    ranges.add(new AckRange(focusIndex, focusIndex));
+                }
+            }
+            if (ranges.size() > maxRanges) {
+                ranges = new ArrayList<>(ranges.subList(0, maxRanges));
+            }
+            return List.copyOf(ranges);
+        }
+
+        private int expandBackward(int index) {
+            int cursor = index;
+            while (cursor - 1 >= 0 && acked.get(cursor - 1)) {
+                cursor--;
+            }
+            return cursor;
+        }
+
+        private int expandForward(int index) {
+            int cursor = index;
+            int max = (int) totalChunks - 1;
+            while (cursor + 1 <= max && acked.get(cursor + 1)) {
+                cursor++;
+            }
+            return cursor;
+        }
+
+        private void updateHighestContiguous() {
+            int max = (int) totalChunks - 1;
+            while (highestContiguous + 1 <= max && acked.get(highestContiguous + 1)) {
+                highestContiguous++;
+            }
+        }
+
     }
 }
