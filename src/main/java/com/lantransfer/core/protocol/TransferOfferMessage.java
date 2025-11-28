@@ -7,7 +7,9 @@ import java.io.IOException;
 public record TransferOfferMessage(int taskId,
                                    String folderName,
                                    long totalBytes,
-                                   int fileCount) implements ProtocolMessage {
+                                   int fileCount,
+                                   int listenPort,
+                                   char taskType) implements ProtocolMessage {
 
     @Override
     public ProtocolMessageType type() {
@@ -20,6 +22,8 @@ public record TransferOfferMessage(int taskId,
         ProtocolIO.writeString(out, folderName);
         out.writeLong(totalBytes);
         out.writeInt(fileCount);
+        out.writeInt(listenPort);
+        out.writeChar(taskType);
     }
 
     public static TransferOfferMessage read(DataInputStream in) throws IOException {
@@ -27,6 +31,8 @@ public record TransferOfferMessage(int taskId,
         String folderName = ProtocolIO.readString(in);
         long totalBytes = in.readLong();
         int fileCount = in.readInt();
-        return new TransferOfferMessage(taskId, folderName, totalBytes, fileCount);
+        int listenPort = in.readInt();
+        char taskType = in.readChar();
+        return new TransferOfferMessage(taskId, folderName, totalBytes, fileCount, listenPort, taskType);
     }
 }

@@ -11,12 +11,15 @@ public class FileChunkBitmap {
     private final Path bitmapPath;
     private final int chunkCount;
     private final BitSet bits;
+    private final int byteSize;
 
     public FileChunkBitmap(Path bitmapPath, int chunkCount) throws IOException {
         this.bitmapPath = bitmapPath;
         this.chunkCount = chunkCount;
+        this.byteSize = (chunkCount + 7) / 8;
         if (Files.exists(bitmapPath)) {
-            this.bits = BitSet.valueOf(Files.readAllBytes(bitmapPath));
+            byte[] data = Files.readAllBytes(bitmapPath);
+            this.bits = BitSet.valueOf(data);
         } else {
             this.bits = new BitSet(chunkCount);
             persist();
@@ -24,6 +27,9 @@ public class FileChunkBitmap {
     }
 
     public synchronized void markReceived(int index) throws IOException {
+        if (bits.get(index)) {
+            return;
+        }
         bits.set(index);
         persist();
     }

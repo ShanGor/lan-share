@@ -35,7 +35,8 @@ Single-purpose LAN file transfer tool with GUI. Sender chooses a folder, Receive
 - **Listening (receiver)**: Configure listen port; show current listening status; start/stop listening; list active/finished transfers with task id, sender address, status, per-file progress.
 - **Session memory**: Remember last-used sender inputs (host, port, folder) and receiver inputs (port, destination) and reload them at startup.
 - **Folder traversal**: Recursive; preserve relative paths when writing on receiver.
-- **File metadata**: For each file send relative path, size (bytes), and MD5 hex; receiver uses MD5 to verify after transfer.
+- **Task scope**: Sender can initiate a task for either a single file or a directory. Task metadata includes task type (F=file, D=directory) and the sender’s listening port.
+- **File metadata**: For each entry send type (F/D), name/path, MD5 hex (for files), and size (for files). Receiver uses MD5 to verify after transfer.
 - **Chunking**:
   - Protocol task id: unsigned 16-bit number (2 bytes). Sender derives it from the low 16 bits of the current timestamp (retrying on collision). Every protocol message carries this task id.
   - File id: unsigned 32-bit number (4 bytes) assigned incrementally per file within a task.
@@ -43,13 +44,13 @@ Single-purpose LAN file transfer tool with GUI. Sender chooses a folder, Receive
   - Chunk header size: 15 bytes = taskId(2) + fileId(4) + chunkSeq(8) + xorKey(1) + bodySize(2). Body remains up to 1024 bytes, XOR’ed with the xor key; receiver applies the same XOR to recover data.
 - **Checksum rules**:
   - No per-chunk CRC32. Integrity is ensured by MD5 per file after full receipt; on failure receiver requests full-file resend.
-- **Resend behavior**:
+- **Resend behavior** (pull-based):
   - Receiver maintains a bitmap file per transferring file on disk; 1 bit per chunk (1 = received, 0 = missing). Bitmap persists until file verified and is reused when resuming after restarts.
-  - Sender uses a sliding window (default 64 chunks per file in flight). Each chunk must receive an ACK (taskId + fileId + chunkSeq); as soon as the oldest chunk is ACKed, the next chunk enters the window. Retransmit unacked chunks after timeout (configurable, limited retries).
-  - Receiver acknowledges each chunk via `CHUNK_ACK` message containing taskId(2) + fileId(4) + chunkSeq(8). Duplicate chunks are detected via the bitmap and re-ACKed without rewriting data.
-  - After a file’s final chunk is ACKed, sender emits `FILE_SEND_DONE`. Receiver checks bitmap; if any chunks are still missing, it issues a `FILE_RESEND_REQUEST` listing the chunkSeq values required.
+  - Receiver drives chunk cadence: for file entries, it computes total chunks from file size and issues `CHUNK_REQUEST` messages (taskId + fileId + chunkSeq). If a requested chunk is not received within 2 seconds, it re-requests that chunk. Sender only sends chunks in response to requests; it no longer emits `FILE_SEND_DONE`.
+  - Receiver acknowledges each chunk via `CHUNK_ACK` message containing taskId(2) + fileId(4) + chunkSeq(8). Duplicate chunks are detected via the bitmap and re-ACKed without rewriting data; chunk writes execute asynchronously via worker threads to keep ACK latency low even when disk is slow.
+  - Directories are signaled via metadata type=D; receiver creates the directory and sends an ACK (`FILE_COMPLETE` success=true) so the sender can proceed.
   - Receiver may request resend of a specific file; sender re-sends metadata and data for that file.
-  - When a file passes MD5 verification, receiver sends a file-done signal so sender and receiver can log completion and update task progress.
+  - When a file passes MD5 verification, receiver sends a file-done signal (`FILE_COMPLETE`) so sender and receiver can log completion and update task progress.
   - Chunk-level retransmission strategy required to cope with UDP loss (see Reliability).
 - **Storage**: Receiver writes to destination directory chosen by user; create subfolders to mirror relative paths; avoid overwriting partial files from failed attempts (e.g., use temp names until success). Persist per-task metadata and bitmap files to allow resume after restart.
 - **Concurrency**: Support multiple simultaneous tasks; the receiver may process multiple transfers in parallel, subject to resource limits.
@@ -59,10 +60,10 @@ Single-purpose LAN file transfer tool with GUI. Sender chooses a folder, Receive
 Message bodies use a simple binary framing; all multi-byte fields in big-endian. Suggested message types:
 - `TRANSFER_OFFER`: sender→receiver; includes task request id, folder name, total bytes, file count.
 - `TRANSFER_RESPONSE`: receiver→sender; Accept/Reject plus receiver-generated task id on accept.
-- `FILE_META`: sender→receiver; includes task id, relative path, file size, MD5 (hex string), file index/order.
-- `FILE_CHUNK`: sender→receiver; stop-and-wait payload containing the 15-byte header (taskId, fileId, chunkSeq, xor key, body size) plus XOR’ed body bytes.
+- `FILE_META`: sender→receiver; includes task id, entry type (F/D), relative path, file size (files), MD5 (files), file index/order.
+- `FILE_CHUNK`: sender→receiver; payload containing the 15-byte header (taskId, fileId, chunkSeq, xor key, body size) plus XOR’ed body bytes, sent only in response to `CHUNK_REQUEST`.
+- `CHUNK_REQUEST`: receiver→sender; requests a specific chunk (taskId(2), fileId(4), chunkSeq(8)).
 - `CHUNK_ACK`: receiver→sender; acknowledges a single chunk (taskId(2), fileId(4), chunkSeq(8)).
-- `FILE_SEND_DONE`: sender→receiver; indicates all chunks for a file have been sent, prompting bitmap check and any missing-chunk requests.
 - `FILE_COMPLETE`: receiver→sender; acknowledges file receipt and MD5 result (OK/FAIL). On OK, both sides log completion and update task lists.
 - `FILE_RESEND_REQUEST`: receiver→sender; identifies file needing resend.
 - `TASK_COMPLETE`: receiver→sender; all files received and validated.
@@ -70,9 +71,9 @@ Message bodies use a simple binary framing; all multi-byte fields in big-endian.
 - `HEARTBEAT/ACK`: optional; used for reliability/keepalive (see Reliability).
 
 ## Reliability and Ordering (UDP)
-- Implement sliding-window acknowledgements:
-  - Up to 16 chunks per file may be in flight at once (default). Each chunk must receive an ACK (taskId + fileId + chunkSeq) before it leaves the window; when the oldest chunk is ACKed, the next chunk is transmitted.
-  - Retransmit unacked chunks after a timeout (configurable) with capped retries. Receiver tracks missing sequences via bitmap and requests retransmission if a `FILE_SEND_DONE` arrives before all chunks are ACKed.
+- Implement pull-based acknowledgements:
+  - Receiver issues `CHUNK_REQUEST` per needed chunk; sender transmits only when requested. Missing or delayed chunks are re-requested after a timeout (default 2 seconds).
+  - Receiver tracks missing sequences via bitmap and requests retransmission if any requested chunks are still outstanding when the file should be complete.
 - Retransmission timeouts and max retries should be configurable (defaults reasonable for LAN).
 - Ensure in-order reassembly per file; drop duplicates.
 - Handle out-of-order delivery.
