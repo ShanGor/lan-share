@@ -2,21 +2,34 @@ package com.lantransfer.core.service;
 
 import com.lantransfer.core.model.TransferStatus;
 import com.lantransfer.core.model.TransferTask;
-import com.lantransfer.core.net.UdpEndpoint;
+import com.lantransfer.core.net.QuicMessageUtil;
 import com.lantransfer.core.protocol.ChunkAckMessage;
 import com.lantransfer.core.protocol.ChunkAckMessage.AckRange;
 import com.lantransfer.core.protocol.ChunkHeader;
 import com.lantransfer.core.protocol.FileChunkMessage;
 import com.lantransfer.core.protocol.FileCompleteMessage;
 import com.lantransfer.core.protocol.FileMetaMessage;
-import com.lantransfer.core.protocol.ProtocolIO;
-import com.lantransfer.core.protocol.ProtocolMessage;
 import com.lantransfer.core.protocol.MetaAckMessage;
+import com.lantransfer.core.protocol.ProtocolMessage;
 import com.lantransfer.core.protocol.TaskCancelMessage;
 import com.lantransfer.core.protocol.TaskCompleteMessage;
 import com.lantransfer.core.protocol.TransferOfferMessage;
 import com.lantransfer.core.protocol.TransferResponseMessage;
 import com.lantransfer.ui.common.TaskTableModel;
+import io.netty.bootstrap.Bootstrap;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.nio.NioDatagramChannel;
+import io.netty.handler.codec.quic.QuicChannel;
+import io.netty.handler.codec.quic.QuicChannelBootstrap;
+import io.netty.handler.codec.quic.QuicClientCodecBuilder;
+import io.netty.handler.codec.quic.QuicSslContext;
+import io.netty.handler.codec.quic.QuicSslContextBuilder;
+import io.netty.handler.codec.quic.QuicStreamChannel;
+import io.netty.handler.codec.quic.QuicStreamType;
+import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
+import io.netty.util.concurrent.Future;
 import javax.swing.SwingUtilities;
 
 import java.io.IOException;
@@ -43,41 +56,44 @@ import java.util.logging.Logger;
 
 public class TransferSenderService implements AutoCloseable {
     private static final Logger log = Logger.getLogger(TransferSenderService.class.getName());
-    private static final int INITIAL_WINDOW_CHUNKS = 32;
-    private static final int MAX_WINDOW_CHUNKS = 512;
-    private static final int MIN_WINDOW_CHUNKS = 4;
+    private static final int INITIAL_WINDOW_CHUNKS = 64;
+    private static final int MAX_WINDOW_CHUNKS = 1024;
+    private static final int MIN_WINDOW_CHUNKS = 8;
     private static final int TIMEOUT_SWEEP_INTERVAL_MS = 25;
     private static final long MIN_CHUNK_TIMEOUT_MS = 50;
     private static final long MAX_CHUNK_TIMEOUT_MS = 2000;
     private static final long RTT_GRANULARITY_MS = 5;
     private static final int MAX_CHUNK_RETRY = 8; // Increased to handle more retries with faster requests
 
-    private final UdpEndpoint endpoint = new UdpEndpoint();
     private final TaskRegistry taskRegistry;
     private final TaskTableModel tableModel;
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private final ExecutorService sendExecutor = Executors.newFixedThreadPool(
+            Math.max(4, Runtime.getRuntime().availableProcessors()));
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
     private final Map<Integer, SenderContext> contexts = new ConcurrentHashMap<>();
+    private final NioEventLoopGroup quicGroup = new NioEventLoopGroup(1);
+    private final QuicSslContext clientSslContext;
 
     public TransferSenderService(TaskRegistry taskRegistry) {
-        this.taskRegistry = taskRegistry;
-        this.tableModel = null;
+        this(taskRegistry, null);
     }
 
     public TransferSenderService(TaskRegistry taskRegistry, TaskTableModel tableModel) {
         this.taskRegistry = taskRegistry;
         this.tableModel = tableModel;
+        this.clientSslContext = createClientSslContext();
     }
 
-    public void start(int port) throws InterruptedException {
-        endpoint.bind(port, (addr, data) -> {
-            try {
-                ProtocolMessage msg = ProtocolIO.fromByteArray(data);
-                handleIncoming(addr, msg);
-            } catch (Exception e) {
-                log.log(Level.WARNING, "Failed to decode incoming packet", e);
-            }
-        });
+    private static QuicSslContext createClientSslContext() {
+        return QuicSslContextBuilder.forClient()
+                .trustManager(InsecureTrustManagerFactory.INSTANCE)
+                .applicationProtocols("lan-transfer")
+                .build();
+    }
+
+    public void start(int port) {
+        log.info("TransferSenderService using QUIC client; no local port binding required.");
     }
 
     public void sendFolder(Path folder, InetSocketAddress receiver, TaskTableModel tableModel) {
@@ -100,8 +116,8 @@ public class TransferSenderService implements AutoCloseable {
             }
             ctx = new SenderContext(taskId, task, receiver, files, dirs, folder);
             contexts.put(taskId, ctx);
-
-            send(receiver, new TransferOfferMessage(taskId, folder.getFileName().toString(), totalBytes, files.size() + dirs.size(), 0, 'D'));
+            ensureConnected(ctx);
+            send(ctx, new TransferOfferMessage(taskId, folder.getFileName().toString(), totalBytes, files.size() + dirs.size(), 0, 'D'));
 
             boolean accepted = ctx.acceptFuture.get(30, TimeUnit.SECONDS);
             if (!accepted) {
@@ -122,6 +138,52 @@ public class TransferSenderService implements AutoCloseable {
         } finally {
             TaskIdGenerator.release(taskId);
         }
+    }
+
+    private void ensureConnected(SenderContext ctx) throws Exception {
+        if (ctx.streamChannel != null && ctx.streamChannel.isActive()) {
+            return;
+        }
+        Bootstrap bootstrap = new Bootstrap();
+        Channel udpChannel = bootstrap.group(quicGroup)
+                .channel(NioDatagramChannel.class)
+                .handler(new QuicClientCodecBuilder()
+                        .sslContext(clientSslContext)
+                        .maxIdleTimeout(5000, TimeUnit.MILLISECONDS)
+                        .initialMaxData(10_000_000)
+                        .initialMaxStreamDataBidirectionalLocal(1_000_000)
+                        .build())
+                .bind(0)
+                .sync()
+                .channel();
+
+        QuicChannelBootstrap quicBootstrap = QuicChannel.newBootstrap(udpChannel)
+                .remoteAddress(ctx.receiver)
+                .streamHandler(new ChannelInitializer<QuicStreamChannel>() {
+                    @Override
+                    protected void initChannel(QuicStreamChannel ch) {
+                        // no-op; we explicitly create streams
+                    }
+                });
+        QuicChannel quicChannel = quicBootstrap.connect().get(15, TimeUnit.SECONDS);
+        Future<QuicStreamChannel> streamFuture = quicChannel.createStream(QuicStreamType.BIDIRECTIONAL,
+                new ChannelInitializer<QuicStreamChannel>() {
+                    @Override
+                    protected void initChannel(QuicStreamChannel ch) {
+                        ch.pipeline().addLast(QuicMessageUtil.newFrameDecoder());
+                        ch.pipeline().addLast(QuicMessageUtil.newInboundHandler((channel, message) ->
+                                handleIncoming(ctx, message)));
+                    }
+                });
+        streamFuture.sync();
+        QuicStreamChannel streamChannel = streamFuture.getNow();
+        ctx.udpChannel = udpChannel;
+        ctx.quicChannel = quicChannel;
+        ctx.streamChannel = streamChannel;
+        streamChannel.closeFuture().addListener(f -> {
+            contexts.remove(ctx.taskId);
+            ctx.cleanup();
+        });
     }
 
     private void sendEntries(SenderContext ctx) throws IOException {
@@ -155,7 +217,7 @@ public class TransferSenderService implements AutoCloseable {
             ctx.currentFilePath = entry.path().toString();
             ctx.maybeRefreshUI(tableModel);
         }
-        send(ctx.receiver, msg);
+        send(ctx, msg);
 
         // Track that FILE_META was sent and schedule retry if no ACK received
         ScheduledFuture<?> retryFuture = scheduler.scheduleWithFixedDelay(() -> {
@@ -175,7 +237,7 @@ public class TransferSenderService implements AutoCloseable {
                     ctx.currentFilePath = retryEntry.path().toString();
                     ctx.maybeRefreshUI(tableModel);
                 }
-                send(ctx.receiver, msg);
+                send(ctx, msg);
             } catch (IOException e) {
                 log.log(Level.WARNING, "Failed to resend FILE_META for fileId " + fileId, e);
             }
@@ -185,27 +247,22 @@ public class TransferSenderService implements AutoCloseable {
         ctx.chunkTimeouts.put(-fileId, retryFuture);
     }
 
-    private void handleIncoming(InetSocketAddress addr, ProtocolMessage msg) {
+    private void handleIncoming(SenderContext ctx, ProtocolMessage msg) {
         switch (msg.type()) {
-            case TRANSFER_RESPONSE -> onTransferResponse((TransferResponseMessage) msg);
-            case CHUNK_ACK -> onChunkAck((ChunkAckMessage) msg);
+            case TRANSFER_RESPONSE -> onTransferResponse(ctx, (TransferResponseMessage) msg);
+            case CHUNK_ACK -> onChunkAck(ctx, (ChunkAckMessage) msg);
             case FILE_COMPLETE -> onFileComplete((FileCompleteMessage) msg);
-            case META_ACK -> onMetaAck((MetaAckMessage) msg);
+            case META_ACK -> onMetaAck(ctx, (MetaAckMessage) msg);
             case TASK_COMPLETE -> onTaskComplete((TaskCompleteMessage) msg);
             default -> log.fine("Ignoring message " + msg.type());
         }
     }
 
-    private void onTransferResponse(TransferResponseMessage msg) {
-        SenderContext ctx = contexts.get(msg.taskId());
-        if (ctx != null) {
-            ctx.acceptFuture.complete(msg.accepted());
-        }
+    private void onTransferResponse(SenderContext ctx, TransferResponseMessage msg) {
+        ctx.acceptFuture.complete(msg.accepted());
     }
 
-    private void onChunkAck(ChunkAckMessage msg) {
-        SenderContext ctx = contexts.get(msg.taskId());
-        if (ctx == null) return;
+    private void onChunkAck(SenderContext ctx, ChunkAckMessage msg) {
         SenderFileState state = ctx.fileStates.get(msg.fileId());
         if (state == null) return;
         boolean shouldSendMore = false;
@@ -240,9 +297,7 @@ public class TransferSenderService implements AutoCloseable {
         }
     }
 
-    private void onMetaAck(MetaAckMessage msg) {
-        SenderContext ctx = contexts.get(msg.taskId());
-        if (ctx == null) return;
+    private void onMetaAck(SenderContext ctx, MetaAckMessage msg) {
         // Mark that FILE_META for this file ID has been acknowledged
         ctx.fileMetaAcked.put(msg.fileId(), true);
         // Cancel any pending retries for this file meta
@@ -356,7 +411,7 @@ public class TransferSenderService implements AutoCloseable {
     }
 
     private void sendChunkAsync(SenderContext ctx, SenderFileState state, long seq, boolean retransmit) {
-        executor.submit(() -> sendChunk(ctx, state, seq, retransmit));
+        sendExecutor.submit(() -> sendChunk(ctx, state, seq, retransmit));
     }
 
     private void sendChunk(SenderContext ctx, SenderFileState state, long seq, boolean retransmit) {
@@ -365,6 +420,7 @@ public class TransferSenderService implements AutoCloseable {
             if (state.closed) {
                 return;
             }
+            ctx.currentFilePath = state.path.toString();
         }
         try {
             chunk = readChunk(state.channel, seq);
@@ -380,7 +436,7 @@ public class TransferSenderService implements AutoCloseable {
         byte xorKey = (byte) (System.nanoTime() & 0xFF);
         byte[] body = xor(chunk, xorKey);
         try {
-            send(ctx.receiver, new FileChunkMessage(ctx.taskId, state.fileId, seq, xorKey, body));
+            send(ctx, new FileChunkMessage(ctx.taskId, state.fileId, seq, xorKey, body));
             if (!retransmit) {
                 ctx.task.addBytesTransferred(body.length);
                 ctx.maybeRefreshUI(tableModel);
@@ -420,7 +476,7 @@ public class TransferSenderService implements AutoCloseable {
         SenderContext ctx = contexts.remove(taskId);
         if (ctx != null) {
             try {
-                send(ctx.receiver, new TaskCancelMessage(taskId));
+                send(ctx, new TaskCancelMessage(taskId));
                 ctx.task.setStatus(TransferStatus.CANCELED);
             } catch (IOException e) {
                 log.log(Level.WARNING, "Failed to send task cancel message", e);
@@ -472,17 +528,21 @@ public class TransferSenderService implements AutoCloseable {
         return total;
     }
 
-    private void send(InetSocketAddress recipient, ProtocolMessage msg) throws IOException {
-        endpoint.send(recipient, ProtocolIO.toByteArray(msg));
+    private void send(SenderContext ctx, ProtocolMessage msg) throws IOException {
+        if (ctx.streamChannel == null || !ctx.streamChannel.isActive()) {
+            throw new IOException("QUIC stream is not active for task " + ctx.taskId);
+        }
+        QuicMessageUtil.write(ctx.streamChannel, msg);
     }
 
     @Override
     public void close() {
-        endpoint.close();
         contexts.values().forEach(SenderContext::cleanup);
         contexts.clear();
         executor.shutdownNow();
+        sendExecutor.shutdownNow();
         scheduler.shutdownNow();
+        quicGroup.shutdownGracefully();
     }
 
     private static class SenderContext {
@@ -499,6 +559,9 @@ public class TransferSenderService implements AutoCloseable {
         final Map<Integer, Boolean> fileMetaAcked = new ConcurrentHashMap<>(); // Track if FILE_META is acknowledged
         final Map<Integer, SenderFileState> fileStates = new ConcurrentHashMap<>();
         volatile String currentFilePath = "";
+        volatile Channel udpChannel;
+        volatile QuicChannel quicChannel;
+        volatile QuicStreamChannel streamChannel;
 
         volatile long lastUiUpdateNanos = System.nanoTime();
         volatile long lastTelemetryLogNanos = System.nanoTime();
@@ -611,6 +674,15 @@ public class TransferSenderService implements AutoCloseable {
                 }
             });
             fileStates.clear();
+            if (streamChannel != null) {
+                streamChannel.close();
+            }
+            if (quicChannel != null) {
+                quicChannel.close();
+            }
+            if (udpChannel != null) {
+                udpChannel.close();
+            }
         }
 
         private void publishTelemetry(TaskTableModel model) {

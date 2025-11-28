@@ -106,11 +106,7 @@ public class SenderFrame extends JFrame {
             }
         }).start();
 
-        try {
-            senderService.start(0); // bind to any available port
-        } catch (InterruptedException ex) {
-            Thread.currentThread().interrupt();
-        }
+        senderService.start(0); // QUIC client no bind needed
 
         browseButton.addActionListener(e -> {
             JFileChooser chooser = new JFileChooser();

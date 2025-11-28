@@ -3,7 +3,7 @@ package com.lantransfer.core.protocol;
 import java.nio.ByteBuffer;
 
 public class ChunkHeader {
-    // Align chunk payload with the common QUIC datagram (~1350 bytes) to reduce per-packet overhead.
+    // Keep payload size near QUIC's default (~1350 bytes) to minimize loss and avoid fragmentation.
     public static final int MAX_BODY_SIZE = 1350;
     public static final int HEADER_SIZE = 2 + 4 + 8 + 1 + 2;
     public static final int MAX_CHUNK_SIZE = HEADER_SIZE + MAX_BODY_SIZE;
