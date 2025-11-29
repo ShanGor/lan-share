@@ -2,11 +2,11 @@
 
 ## Project Overview
 
-Lan Transfer is a Java-based LAN file transfer tool that enables reliable folder/file transfers between devices on the same local network. The application features a Swing-based GUI with separate sender and receiver modes, using UDP transport via Netty for communication.
+Lan Transfer is a Java-based LAN file transfer tool that enables reliable folder/file transfers between devices on the same local network. The application features a Swing-based GUI with separate sender and receiver modes, using QUIC transport via Netty for communication.
 
 ### Key Features
 - **GUI-based operation**: Java Swing interface for sender and receiver modes
-- **UDP transport**: Uses Netty 4.2.7.Final for UDP communication
+- **QUIC transport**: Uses Netty 4.2.7.Final for QUIC communication
 - **Reliable transfer**: Implements chunked file transfer with MD5 verification
 - **Resumable tasks**: Persists transfer state to allow resumption after restart
 - **Chunk obfuscation**: XOR-obscured chunk bodies for basic obfuscation
@@ -15,8 +15,8 @@ Lan Transfer is a Java-based LAN file transfer tool that enables reliable folder
 
 ### Architecture
 - **Sender mode**: Initiates file transfers by selecting a source folder and specifying receiver host/port
-- **Receiver mode**: Listens on a configured UDP port and accepts/rejects incoming transfer offers
-- **Protocol**: Binary UDP messages with specific message types for transfer negotiation, metadata, chunks, and control signals
+- **Receiver mode**: Listens on a configured QUIC port and accepts/rejects incoming transfer offers
+- **Protocol**: Binary QUIC messages with specific message types for transfer negotiation, metadata, chunks, and control signals
 - **Storage**: Persists transfer state and chunk bitmaps to enable resume functionality
 
 ## Building and Running
@@ -65,8 +65,9 @@ src/main/java/com/lantransfer/
 ```
 
 ### Dependencies
-- Netty (4.2.7.Final) - UDP transport implementation
+- Netty (4.2.7.Final) - QUIC transport implementation
 - Java Swing - GUI components
+- Bouncy Castle (1.80) - Security utilities
 - Maven - Build and dependency management
 
 ### Configuration
@@ -82,18 +83,20 @@ The project is configured via Maven's `pom.xml` with:
 - `TRANSFER_OFFER`: Sender → Receiver, contains transfer request details
 - `TRANSFER_RESPONSE`: Receiver → Sender, accept/reject response with task ID
 - `FILE_META`: Sender → Receiver, file metadata (path, size, MD5)
-- `FILE_CHUNK`: Sender → Receiver, file data chunk with 11-byte header
-- `FILE_SEND_DONE`: Sender → Receiver, indicates all chunks sent for a file
+- `FILE_CHUNK`: Sender → Receiver, file data chunk with header
 - `FILE_COMPLETE`: Receiver → Sender, file validation result (OK/FAIL)
 - `FILE_RESEND_REQUEST`: Receiver → Sender, request for specific file resend
 - `TASK_COMPLETE`: Receiver → Sender, all files completed
 - `TASK_CANCEL`: Sender → Receiver, cancel transfer
+- `CHUNK_ACK`: Receiver → Sender, selective ACK for received chunks
+- `META_ACK`: Receiver → Sender, acknowledges receipt of file metadata
 
-### Chunk Format (1011 bytes total)
+### Chunk Format
+- 1011 bytes total
 - Bytes 0-7: `long` sequence number (64-bit)
 - Byte 8: `byte` XOR key for obfuscation
-- Bytes 9-10: `short` body size (16-bit, 0-1000)
-- Bytes 11+: Chunk body (up to 1000 bytes), XOR'd with key
+- Bytes 9-10: `short` body size (16-bit)
+- Bytes 11+: Chunk body, XOR'd with key
 
 ### Reliability Features
 - Bitmap-based chunk tracking with persistence
@@ -105,7 +108,7 @@ The project is configured via Maven's `pom.xml` with:
 
 ### Coding Standards
 - Java 17 with standard Maven project structure
-- Netty for UDP networking implementation
+- Netty for QUIC networking implementation
 - Swing for GUI development
 - Maven for build and dependency management
 
@@ -127,3 +130,6 @@ According to the README, the following work is still outstanding:
 - `requirements/lan-transfer-requirements.md`: Detailed functional and technical requirements
 - `src/main/java/com/lantransfer/LanTransferApp.java`: Application entry point
 - `src/main/java/com/lantransfer/ui/ModeSelectorFrame.java`: Initial UI frame
+- `src/main/java/com/lantransfer/core/service/TransferSenderService.java`: Core sending logic
+- `src/main/java/com/lantransfer/core/service/TransferReceiverService.java`: Core receiving logic
+- `src/main/java/com/lantransfer/core/protocol/`: Protocol message implementations

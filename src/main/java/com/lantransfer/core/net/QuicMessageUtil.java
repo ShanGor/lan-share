@@ -11,6 +11,8 @@ import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
 
 import java.io.IOException;
 import java.util.function.BiConsumer;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /**
  * Helpers for framing protocol messages over QUIC streams.
@@ -28,11 +30,16 @@ public final class QuicMessageUtil {
     public static ChannelHandler newInboundHandler(BiConsumer<Channel, ProtocolMessage> consumer) {
         return new SimpleChannelInboundHandler<ByteBuf>() {
             @Override
-            protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) throws Exception {
-                byte[] data = new byte[msg.readableBytes()];
-                msg.readBytes(data);
-                ProtocolMessage protocolMessage = ProtocolIO.fromByteArray(data);
-                consumer.accept(ctx.channel(), protocolMessage);
+            protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) {
+                try {
+                    byte[] data = new byte[msg.readableBytes()];
+                    msg.readBytes(data);
+                    ProtocolMessage protocolMessage = ProtocolIO.fromByteArray(data);
+                    consumer.accept(ctx.channel(), protocolMessage);
+                } catch (Exception e) {
+                    Logger.getLogger(QuicMessageUtil.class.getName()).log(Level.WARNING, "Error decoding protocol message", e);
+                    ctx.fireExceptionCaught(e);
+                }
             }
         };
     }
@@ -42,6 +49,9 @@ public final class QuicMessageUtil {
         ByteBuf buf = channel.alloc().buffer(4 + data.length);
         buf.writeInt(data.length);
         buf.writeBytes(data);
+        System.out.println("DEBUG: Writing " + message.type() + " to channel " + channel +
+                         ", data length: " + data.length + ", channel active: " + channel.isActive());
         channel.writeAndFlush(buf);
+        System.out.println("DEBUG: Write completed for " + message.type());
     }
 }

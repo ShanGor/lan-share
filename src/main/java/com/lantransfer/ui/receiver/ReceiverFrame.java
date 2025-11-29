@@ -147,6 +147,21 @@ public class ReceiverFrame extends JFrame {
             statusLabel.setText("Status: Stopped");
         });
 
+        // Auto-start listening on the default port if destination is set
+        if (!prefs.destination().isEmpty()) {
+            try {
+                receiverService.start(prefs.port(), Path.of(prefs.destination()));
+                listenButton.setEnabled(false);
+                stopButton.setEnabled(true);
+                portField.setEnabled(false);
+                browseButton.setEnabled(false);
+                statusLabel.setText("Status: Listening on port " + prefs.port());
+            } catch (Exception ex) {
+                // Log the error but continue with manual start
+                statusLabel.setText("Status: Auto-start failed, click Start Listening");
+            }
+        }
+
         setSize(720, 480);
         setLocationRelativeTo(null);
         addWindowListener(new WindowAdapter() {

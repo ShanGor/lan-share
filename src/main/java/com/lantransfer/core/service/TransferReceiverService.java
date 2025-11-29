@@ -11,7 +11,6 @@ import com.lantransfer.core.protocol.FileChunkMessage;
 import com.lantransfer.core.protocol.FileCompleteMessage;
 import com.lantransfer.core.protocol.FileMetaMessage;
 import com.lantransfer.core.protocol.MetaAckMessage;
-import com.lantransfer.core.protocol.ProtocolIO;
 import com.lantransfer.core.protocol.ProtocolMessage;
 import com.lantransfer.core.protocol.TaskCancelMessage;
 import com.lantransfer.core.protocol.TaskCompleteMessage;
@@ -19,9 +18,9 @@ import com.lantransfer.core.protocol.TransferOfferMessage;
 import com.lantransfer.core.protocol.TransferResponseMessage;
 import com.lantransfer.ui.common.TaskTableModel;
 import io.netty.bootstrap.Bootstrap;
-import io.netty.buffer.ByteBuf;
 import io.netty.channel.*;
-import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.MultiThreadIoEventLoopGroup;
+import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.handler.codec.quic.InsecureQuicTokenHandler;
 import io.netty.handler.codec.quic.QuicChannel;
@@ -34,13 +33,13 @@ import io.netty.pkitesting.CertificateBuilder;
 import javax.swing.JOptionPane;
 import javax.swing.SwingUtilities;
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.nio.channels.ClosedChannelException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.security.KeyPair;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.BitSet;
@@ -49,7 +48,6 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -61,8 +59,9 @@ public class TransferReceiverService implements AutoCloseable {
     private final TaskTableModel tableModel;
     private final ExecutorService workerPool = Executors.newFixedThreadPool(Math.max(2, Runtime.getRuntime().availableProcessors() / 2));
     private final Map<Integer, ReceiverContext> contexts = new ConcurrentHashMap<>();
-    private NioEventLoopGroup serverGroup;
+    private MultiThreadIoEventLoopGroup serverGroup;
     private Channel serverChannel;
+    private QuicSslContext serverSslContext;
     private Path destinationRoot;
 
     public TransferReceiverService(TaskRegistry taskRegistry, TaskTableModel tableModel) {
@@ -71,6 +70,7 @@ public class TransferReceiverService implements AutoCloseable {
     }
 
     public void start(int port, Path destinationRoot) throws Exception {
+        log.info("Starting receiver on port " + port + " with destination: " + destinationRoot);
         this.destinationRoot = destinationRoot;
         CertificateBuilder builder = new CertificateBuilder();
 
@@ -79,63 +79,69 @@ public class TransferReceiverService implements AutoCloseable {
                 .notBefore(Instant.now())
                 .notAfter(Instant.now().plusSeconds(365 * 24L * 3600L))
                 .buildSelfSigned() ;
+        log.info("SSL certificate created for server");
 
-        QuicSslContext serverSslContext = QuicSslContextBuilder.forServer(certificate.toKeyManagerFactory(), null)
+        serverSslContext = QuicSslContextBuilder.forServer(certificate.toKeyManagerFactory(), null)
                 .applicationProtocols("lan-transfer")
                 .build();
-        ChannelInitializer<QuicStreamChannel> streamInitializer = new ChannelInitializer<QuicStreamChannel>() {
+        log.info("SSL context created for server");
+        ChannelInitializer<QuicStreamChannel> streamInitializer = new ChannelInitializer<>() {
             @Override
             protected void initChannel(QuicStreamChannel ch) {
+                log.info("Initializing stream channel: " + ch);
                 ch.pipeline().addLast(QuicMessageUtil.newFrameDecoder());
-                ch.pipeline().addLast(new SimpleChannelInboundHandler<ByteBuf>() {
-                    @Override
-                    protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) throws Exception {
-                        byte[] data = new byte[msg.readableBytes()];
-                        msg.readBytes(data);
-                        ProtocolMessage protocolMessage = ProtocolIO.fromByteArray(data);
-                        handleIncoming((QuicStreamChannel) ctx.channel(), protocolMessage);
-                    }
-
-                    @Override
-                    public void channelInactive(ChannelHandlerContext ctx) throws Exception {
-                        super.channelInactive(ctx);
-                        cleanupChannel((QuicStreamChannel) ctx.channel());
-                    }
+                ch.pipeline().addLast(QuicMessageUtil.newInboundHandler((channel, message) ->
+                        handleIncoming((QuicStreamChannel) channel, message)));
+                ch.closeFuture().addListener(f -> {
+                    log.info("Stream channel closed: " + ch);
+                    cleanupChannel(ch);
                 });
             }
         };
         ChannelHandler codec = new QuicServerCodecBuilder()
                 .sslContext(serverSslContext)
-                .maxIdleTimeout(5000, TimeUnit.MILLISECONDS)
+                .maxIdleTimeout(TimeUnit.HOURS.toMillis(12), TimeUnit.MILLISECONDS)
                 .initialMaxData(10_000_000)
                 .initialMaxStreamDataBidirectionalLocal(1_000_000)
+                .initialMaxStreamDataBidirectionalRemote(1_000_000)
                 .initialMaxStreamsBidirectional(100)
                 .tokenHandler(InsecureQuicTokenHandler.INSTANCE)
                 .handler(new ChannelInitializer<QuicChannel>() {
                     @Override
                     protected void initChannel(QuicChannel ch) {
-                        // no-op
+                        log.info("QUIC channel initialized: " + ch);
+                        ch.closeFuture().addListener(f -> {
+                            log.info("QUIC channel closed: " + ch);
+                        });
                     }
                 })
                 .streamHandler(streamInitializer)
                 .build();
-        serverGroup = new NioEventLoopGroup(1);
+        serverGroup = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
         Bootstrap bootstrap = new Bootstrap();
+        log.info("Binding QUIC server to port " + port);
         serverChannel = bootstrap.group(serverGroup)
                 .channel(NioDatagramChannel.class)
                 .handler(codec)
                 .bind(port)
                 .sync()
                 .channel();
-        log.info("QUIC receiver listening on port " + port);
+        log.info("QUIC receiver successfully listening on port " + port + " at " + serverChannel.localAddress());
     }
 
     private void handleIncoming(QuicStreamChannel channel, ProtocolMessage msg) {
+        log.info("Receiver received message: " + msg.type() + " on channel " + channel + " from remote: " + channel.remoteAddress());
         try {
             switch (msg.type()) {
-                case TRANSFER_OFFER -> onOffer(channel, (TransferOfferMessage) msg);
-                case FILE_META -> onFileMeta(channel, (FileMetaMessage) msg);
-                case FILE_CHUNK -> onFileChunk(channel, (FileChunkMessage) msg);
+                case TRANSFER_OFFER -> {
+                    log.info("Processing TRANSFER_OFFER message: " + msg);
+                    TransferOfferMessage offer = (TransferOfferMessage) msg;
+                    log.info("Transfer offer details - Folder: " + offer.folderName() +
+                             ", Files: " + offer.fileCount() +
+                             ", Bytes: " + offer.totalBytes());
+                    onOffer(channel, offer);
+                }
+                case FILE_META, FILE_CHUNK -> log.fine("Ignoring data message on control channel");
                 case TASK_CANCEL -> onTaskCancel((TaskCancelMessage) msg);
                 case CHUNK_ACK -> { /* ignore */ }
                 default -> log.fine("Ignoring message " + msg.type());
@@ -145,11 +151,37 @@ public class TransferReceiverService implements AutoCloseable {
         }
     }
 
+    private void handleDataMessage(QuicStreamChannel channel, ProtocolMessage msg) {
+        log.info("DATA CHANNEL: Receiver received message: " + msg.type() + " on channel " + channel + " from remote: " + channel.remoteAddress());
+        try {
+            switch (msg.type()) {
+                case FILE_META -> {
+                    log.info("DATA CHANNEL: Processing FILE_META for taskId: " + ((FileMetaMessage) msg).taskId() + ", fileId: " + ((FileMetaMessage) msg).fileId());
+                    onFileMeta(channel, (FileMetaMessage) msg);
+                }
+                case FILE_CHUNK -> {
+                    log.info("DATA CHANNEL: Processing FILE_CHUNK for taskId: " + ((FileChunkMessage) msg).taskId() + ", fileId: " + ((FileChunkMessage) msg).fileId() + ", chunk: " + ((FileChunkMessage) msg).chunkSeq());
+                    onFileChunk(channel, (FileChunkMessage) msg);
+                }
+                case TASK_CANCEL -> onTaskCancel((TaskCancelMessage) msg);
+                case CHUNK_ACK, TRANSFER_RESPONSE, TRANSFER_OFFER -> {
+                    // ignore on data channel
+                }
+                default -> log.fine("Ignoring data message " + msg.type());
+            }
+        } catch (Exception e) {
+            log.log(Level.WARNING, "Error handling data message " + msg.type(), e);
+        }
+    }
+
     private void cleanupChannel(QuicStreamChannel channel) {
         contexts.entrySet().removeIf(entry -> {
             ReceiverContext ctx = entry.getValue();
-            if (ctx.channel == channel) {
-                ctx.task.setStatus(TransferStatus.FAILED);
+            if (ctx.controlChannel == channel) {
+                ctx.controlChannel = null;
+                if (ctx.task.getStatus() != TransferStatus.COMPLETED) {
+                    ctx.task.setStatus(TransferStatus.FAILED);
+                }
                 ctx.cleanup();
                 return true;
             }
@@ -158,46 +190,65 @@ public class TransferReceiverService implements AutoCloseable {
     }
 
     private void onOffer(QuicStreamChannel channel, TransferOfferMessage offer) {
-        boolean accept = promptAccept(offer);
-        sendUnchecked(channel, new TransferResponseMessage(offer.taskId(), accept));
-        if (!accept) return;
+        log.info("onOffer called with offer: " + offer);
+        Runnable uiTask = () -> {
+            try {
+                log.info("Showing accept dialog for offer: " + offer);
+                boolean accept = showAcceptDialog(offer);
+                log.info("Dialog result: " + (accept ? "ACCEPTED" : "REJECTED"));
+                channel.eventLoop().execute(() -> handleOfferDecision(channel, offer, accept));
+            } catch (Exception e) {
+                log.log(Level.SEVERE, "Error in onOffer UI task", e);
+            }
+        };
+        if (SwingUtilities.isEventDispatchThread()) {
+            log.info("Already on EDT, running UI task directly");
+            uiTask.run();
+        } else {
+            log.info("Not on EDT, invoking UI task later");
+            SwingUtilities.invokeLater(uiTask);
+        }
+    }
+
+    private void handleOfferDecision(QuicStreamChannel channel, TransferOfferMessage offer, boolean accept) {
+        if (!accept) {
+            sendUnchecked(channel, new TransferResponseMessage(offer.taskId(), false, 0));
+            return;
+        }
         TransferTask task = new TransferTask(offer.taskId(), Path.of(offer.folderName()), destinationRoot, offer.totalBytes());
         task.setStatus(TransferStatus.IN_PROGRESS);
         taskRegistry.add(task);
         if (tableModel != null) tableModel.addTask(task);
         ReceiverContext ctx = new ReceiverContext(task, channel, offer.fileCount());
-        contexts.put(offer.taskId(), ctx);
-    }
-
-    private boolean promptAccept(TransferOfferMessage offer) {
-        if (SwingUtilities.isEventDispatchThread()) {
-            return showAcceptDialog(offer);
-        }
-        FutureTask<Boolean> task = new FutureTask<>(() -> showAcceptDialog(offer));
-        SwingUtilities.invokeLater(task);
         try {
-            return task.get();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return false;
+            int dataPort = ctx.ensureDataServer();
+            contexts.put(offer.taskId(), ctx);
+            sendUnchecked(channel, new TransferResponseMessage(offer.taskId(), true, dataPort));
         } catch (Exception e) {
-            log.log(Level.WARNING, "Failed to prompt for incoming transfer", e);
-            return false;
+            log.log(Level.SEVERE, "Failed to start data server for task " + offer.taskId(), e);
+            sendUnchecked(channel, new TransferResponseMessage(offer.taskId(), false, 0));
+            ctx.cleanup();
         }
     }
 
     private boolean showAcceptDialog(TransferOfferMessage offer) {
+        log.info("Creating JOptionPane for transfer offer: " + offer.folderName());
         int choice = JOptionPane.showConfirmDialog(null,
                 "Incoming transfer: " + offer.folderName() + "\nFiles: " + offer.fileCount() + "\nTotal bytes: " + offer.totalBytes(),
                 "Incoming Transfer", JOptionPane.YES_NO_OPTION);
+        log.info("JOptionPane result: " + choice);
         return choice == JOptionPane.YES_OPTION;
     }
 
     private void onFileMeta(QuicStreamChannel channel, FileMetaMessage msg) throws IOException {
+        log.info("FILE_META: Processing for taskId: " + msg.taskId() + ", fileId: " + msg.fileId() + ", path: " + msg.relativePath() + ", size: " + msg.size());
         ReceiverContext ctx = contexts.get(msg.taskId());
-        if (ctx == null) return;
-        if (ctx.channel != channel) {
-            log.warning("Ignoring FILE_META for task " + msg.taskId() + " from unexpected channel.");
+        if (ctx == null) {
+            log.warning("FILE_META: No context found for taskId: " + msg.taskId());
+            return;
+        }
+        if (ctx.dataChannel != channel) {
+            log.warning("FILE_META: Ignoring for task " + msg.taskId() + " from unexpected channel.");
             return;
         }
         Path target = destinationRoot.resolve(msg.relativePath()).normalize();
@@ -207,7 +258,9 @@ public class TransferReceiverService implements AutoCloseable {
         }
 
         // Send META_ACK to acknowledge receipt of metadata
+        log.info("Sending META_ACK for taskId: " + msg.taskId() + ", fileId: " + msg.fileId());
         sendUnchecked(channel, new MetaAckMessage(msg.taskId(), msg.fileId()));
+        log.info("META_ACK sent successfully");
 
         if (msg.entryType() == 'D') {
             Files.createDirectories(target);
@@ -238,10 +291,21 @@ public class TransferReceiverService implements AutoCloseable {
     }
 
     private void onFileChunk(QuicStreamChannel channel, FileChunkMessage msg) {
+        log.info("FILE_CHUNK: Processing for taskId: " + msg.taskId() + ", fileId: " + msg.fileId() + ", chunk: " + msg.chunkSeq() + ", body size: " + msg.body().length);
         ReceiverContext ctx = contexts.get(msg.taskId());
-        if (ctx == null || ctx.channel != channel) return;
+        if (ctx == null) {
+            log.warning("FILE_CHUNK: No context found for taskId: " + msg.taskId());
+            return;
+        }
+        if (ctx.dataChannel != channel) {
+            log.warning("FILE_CHUNK: Wrong channel for task " + msg.taskId());
+            return;
+        }
         ReceiverFile rf = ctx.files.get(msg.fileId());
-        if (rf == null) return;
+        if (rf == null) {
+            log.warning("FILE_CHUNK: No file state found for fileId: " + msg.fileId());
+            return;
+        }
 
         // Update current file path for UI display
         ctx.currentFilePath = rf.target.toString();
@@ -267,9 +331,11 @@ public class TransferReceiverService implements AutoCloseable {
         long offset = msg.chunkSeq() * ChunkHeader.MAX_BODY_SIZE;
         boolean wrote = false;
         try {
+            log.info("WRITE_CHUNK: Writing chunk " + index + " (size: " + decoded.length + ") to " + rf.target + " at offset " + offset);
             rf.writeChunk(offset, decoded);
             rf.markReceived(index);
             ctx.task.addBytesTransferred(decoded.length);
+            log.info("WRITE_CHUNK: Added " + decoded.length + " bytes to progress, total: " + ctx.task.getBytesTransferred());
             ctx.maybeRefreshUI(tableModel);
             wrote = true;
         } catch (ClosedChannelException e) {
@@ -289,7 +355,9 @@ public class TransferReceiverService implements AutoCloseable {
 
     private void sendAck(ReceiverContext ctx, ReceiverFile rf, int taskId, int fileId, int focusIndex) {
         List<AckRange> ranges = rf.ackRangesFor(focusIndex, MAX_ACK_RANGES);
-        sendUnchecked(ctx.channel, new ChunkAckMessage(taskId, fileId, ranges));
+        if (ctx.dataChannel != null) {
+            sendUnchecked(ctx.dataChannel, new ChunkAckMessage(taskId, fileId, ranges));
+        }
     }
 
     private void verifyAndComplete(ReceiverContext ctx, int taskId, int fileId, ReceiverFile rf) {
@@ -300,13 +368,17 @@ public class TransferReceiverService implements AutoCloseable {
         }
         try {
             if (!Files.exists(rf.tempFile)) {
-                sendUnchecked(ctx.channel, new FileCompleteMessage(taskId, fileId, false));
+                if (ctx.dataChannel != null) {
+                    sendUnchecked(ctx.dataChannel, new FileCompleteMessage(taskId, fileId, false));
+                }
                 ctx.task.setStatus(TransferStatus.RESENDING);
                 return;
             }
             String md5 = new ChecksumService().md5(rf.tempFile);
             boolean ok = md5.equalsIgnoreCase(rf.expectedMd5);
-            sendUnchecked(ctx.channel, new FileCompleteMessage(taskId, fileId, ok));
+            if (ctx.dataChannel != null) {
+                sendUnchecked(ctx.dataChannel, new FileCompleteMessage(taskId, fileId, ok));
+            }
             if (ok) {
                 boolean moved = moveFileWithRetry(rf.tempFile, rf.target);
                 if (moved) {
@@ -314,7 +386,9 @@ public class TransferReceiverService implements AutoCloseable {
                     ctx.completedFiles++;
                     if (ctx.completedFiles >= ctx.expectedFiles) {
                         ctx.task.setStatus(TransferStatus.COMPLETED);
-                        sendUnchecked(ctx.channel, new TaskCompleteMessage(taskId));
+                        if (ctx.dataChannel != null) {
+                            sendUnchecked(ctx.dataChannel, new TaskCompleteMessage(taskId));
+                        }
                         if (contexts.remove(taskId, ctx)) {
                             ctx.cleanup();
                         }
@@ -401,19 +475,96 @@ public class TransferReceiverService implements AutoCloseable {
         return false;
     }
 
-    private static class ReceiverContext {
+    private final class DataTransferServer implements AutoCloseable {
+        private final ReceiverContext context;
+        private final MultiThreadIoEventLoopGroup group = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
+        private Channel udpChannel;
+        private int port;
+
+        DataTransferServer(ReceiverContext context) {
+            this.context = context;
+        }
+
+        int start() throws Exception {
+            log.info("Starting data transfer server...");
+            ChannelHandler codec = new QuicServerCodecBuilder()
+                    .sslContext(serverSslContext)
+                    .maxIdleTimeout(TimeUnit.HOURS.toMillis(12), TimeUnit.MILLISECONDS)
+                    .initialMaxData(10_000_000)
+                    .initialMaxStreamDataBidirectionalLocal(1_000_000)
+                    .initialMaxStreamsBidirectional(4)
+                    .tokenHandler(InsecureQuicTokenHandler.INSTANCE)
+                    .handler(new ChannelInitializer<QuicChannel>() {
+                        @Override
+                        protected void initChannel(QuicChannel ch) {
+                            log.info("Data server QUIC channel initialized: " + ch + " from remote: " + ch.remoteAddress());
+                        }
+                    })
+                    .streamHandler(new ChannelInitializer<QuicStreamChannel>() {
+                        @Override
+                        protected void initChannel(QuicStreamChannel ch) {
+                            log.info("DATA SERVER: Stream channel created: " + ch + " from remote: " + ch.remoteAddress());
+                            context.dataChannel = ch;
+                            ch.pipeline().addLast(QuicMessageUtil.newFrameDecoder());
+                            ch.pipeline().addLast(QuicMessageUtil.newInboundHandler((channel, message) ->
+                                    handleDataMessage((QuicStreamChannel) channel, message)));
+                            ch.closeFuture().addListener(f -> {
+                                log.info("DATA SERVER: Stream channel closed: " + ch);
+                                context.dataChannel = null;
+                            });
+                        }
+                    })
+                    .build();
+            udpChannel = new Bootstrap().group(group)
+                    .channel(NioDatagramChannel.class)
+                    .handler(codec)
+                    .bind(0)
+                    .sync()
+                    .channel();
+            port = ((InetSocketAddress) udpChannel.localAddress()).getPort();
+            return port;
+        }
+
+        @Override
+        public void close() {
+            if (udpChannel != null) {
+                udpChannel.close();
+            }
+            group.shutdownGracefully();
+        }
+
+        int port() {
+            return port;
+        }
+    }
+
+    private class ReceiverContext {
         final TransferTask task;
-        final QuicStreamChannel channel;
         final Map<Integer, ReceiverFile> files = new ConcurrentHashMap<>();
         final int expectedFiles;
         volatile int completedFiles = 0;
         volatile long lastUiUpdateNanos = System.nanoTime();
         volatile String currentFilePath = "";
+        volatile QuicStreamChannel controlChannel;
+        volatile QuicStreamChannel dataChannel;
+        DataTransferServer dataServer;
 
-        ReceiverContext(TransferTask task, QuicStreamChannel channel, int expectedFiles) {
+        ReceiverContext(TransferTask task, QuicStreamChannel controlChannel, int expectedFiles) {
             this.task = task;
-            this.channel = channel;
+            this.controlChannel = controlChannel;
             this.expectedFiles = expectedFiles;
+        }
+
+        int ensureDataServer() throws Exception {
+            if (dataServer == null) {
+                log.info("Creating data transfer server for task " + task.getProtocolTaskId());
+                dataServer = new DataTransferServer(this);
+                dataServer.start();
+                log.info("Data transfer server started on port " + dataServer.port());
+            } else {
+                log.info("Data transfer server already running on port " + dataServer.port());
+            }
+            return dataServer.port();
         }
 
         void maybeRefreshUI(TaskTableModel model) {
@@ -430,8 +581,14 @@ public class TransferReceiverService implements AutoCloseable {
         void cleanup() {
             files.values().forEach(ReceiverFile::closeQuietly);
             files.clear();
-            if (channel != null) {
-                channel.close();
+            if (controlChannel != null) {
+                controlChannel.close();
+            }
+            if (dataChannel != null) {
+                dataChannel.close();
+            }
+            if (dataServer != null) {
+                dataServer.close();
             }
         }
     }
