@@ -20,7 +20,7 @@ mvn clean package
 
 ## Run
 ```bash
-mvn exec:java -Dexec.mainClass=com.lantransfer.LanTransferApp
+mvn exec:java -Dexec.mainClass=io.github.shangor.lan.transfer.LanTransferApp
 ```
 or run the packaged jar:
 ```bash

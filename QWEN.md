@@ -38,7 +38,7 @@ mvn clean package
 ### Run Commands
 ```bash
 # Run via Maven
-mvn exec:java -Dexec.mainClass=com.lantransfer.LanTransferApp
+mvn exec:java -Dexec.mainClass=io.github.shangor.lan.transfer.LanTransferApp
 
 # Run packaged jar
 java -jar target/lan-transfer-0.1.0-SNAPSHOT.jar
@@ -74,7 +74,7 @@ src/main/java/com/lantransfer/
 The project is configured via Maven's `pom.xml` with:
 - Java 17 source/target compatibility
 - Netty dependency version 4.2.7.Final
-- JAR packaging with main class `com.lantransfer.LanTransferApp`
+- JAR packaging with main class `io.github.shangor.lan.transfer.LanTransferApp`
 - Assembly plugin for fat JAR creation
 
 ## Protocol Details
