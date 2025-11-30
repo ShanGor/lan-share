@@ -30,6 +30,7 @@ import io.netty.handler.codec.quic.QuicSslContextBuilder;
 import io.netty.handler.codec.quic.QuicStreamChannel;
 import io.netty.pkitesting.CertificateBuilder;
 
+import javax.swing.JDialog;
 import javax.swing.JOptionPane;
 import javax.swing.SwingUtilities;
 import java.io.IOException;
@@ -246,9 +247,15 @@ public class TransferReceiverService implements AutoCloseable {
 
     private boolean showAcceptDialog(TransferOfferMessage offer) {
         log.info("Creating JOptionPane for transfer offer: " + offer.folderName());
-        int choice = JOptionPane.showConfirmDialog(null,
-                "Incoming transfer: " + offer.folderName() + "\nFiles: " + offer.fileCount() + "\nTotal bytes: " + offer.totalBytes(),
-                "Incoming Transfer", JOptionPane.YES_NO_OPTION);
+        String message = "Incoming transfer: " + offer.folderName() + "\nFiles: " + offer.fileCount() + "\nTotal bytes: " + offer.totalBytes();
+        JOptionPane optionPane = new JOptionPane(message, JOptionPane.QUESTION_MESSAGE, JOptionPane.YES_NO_OPTION);
+        JDialog dialog = optionPane.createDialog("Incoming Transfer");
+        dialog.setAlwaysOnTop(true); // ensure dialog is visible above other windows
+        dialog.toFront();
+        dialog.setVisible(true);
+        dialog.dispose();
+        Object selectedValue = optionPane.getValue();
+        int choice = selectedValue instanceof Integer ? (Integer) selectedValue : JOptionPane.CLOSED_OPTION;
         log.info("JOptionPane result: " + choice);
         return choice == JOptionPane.YES_OPTION;
     }
