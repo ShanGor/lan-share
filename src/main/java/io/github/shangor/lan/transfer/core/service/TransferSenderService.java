@@ -406,6 +406,16 @@ public class TransferSenderService implements AutoCloseable {
             while (seq < state.totalChunks) {
                 if (state.closed) return;
 
+                // Flow control: wait if channel is not writable
+                while (ctx.dataStreamChannel != null && !ctx.dataStreamChannel.isWritable()) {
+                    try {
+                        Thread.sleep(5);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+
                 byte[] chunk = readChunk(state.channel, seq);
                 if (chunk.length == 0) break;
 
@@ -523,7 +533,7 @@ public class TransferSenderService implements AutoCloseable {
         }
         // Reduced logging for performance
         byte[] data = ProtocolIO.toByteArray(msg);
-        ctx.task.addBytesTransferred(data.length);
+        // ctx.task.addBytesTransferred(data.length); // Removed to avoid double counting and protocol overhead
         QuicMessageUtil.write(channel, msg);
     }
 

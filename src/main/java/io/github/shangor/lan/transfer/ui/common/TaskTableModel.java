@@ -11,7 +11,7 @@ import java.util.Map;
 
 public class TaskTableModel extends AbstractTableModel {
     private final List<TransferTask> tasks = new ArrayList<>();
-    private final String[] columns = {"Task ID", "Status", "Progress", "Speed (KB/s)", "Transferred", "Total", "Current File"};
+    private final String[] columns = {"Task ID", "Status", "Progress", "Speed (KB/s)", "Transferred", "Total", "Duration", "Current File"};
     private final Map<String, Long> lastBytes = new HashMap<>();
     private final Map<String, Long> lastTimes = new HashMap<>();
     private final Map<String, Double> speeds = new HashMap<>();
@@ -52,7 +52,8 @@ public class TaskTableModel extends AbstractTableModel {
             case 3 -> speed(task);
             case 4 -> formatBytes(task.getBytesTransferred());
             case 5 -> formatBytes(task.getTotalBytes());
-            case 6 -> currentFileMap.getOrDefault(task.getTaskId(), "");
+            case 6 -> formatDuration(task.getDuration());
+            case 7 -> currentFileMap.getOrDefault(task.getTaskId(), "");
             default -> "";
         };
     }
@@ -127,5 +128,16 @@ public class TaskTableModel extends AbstractTableModel {
 
     private String formatBytes(long value) {
         return String.format("%,d", value);
+    }
+
+    private String formatDuration(java.time.Duration duration) {
+        long seconds = duration.getSeconds();
+        long absSeconds = Math.abs(seconds);
+        String positive = String.format(
+            "%d:%02d:%02d",
+            absSeconds / 3600,
+            (absSeconds % 3600) / 60,
+            absSeconds % 60);
+        return seconds < 0 ? "-" + positive : positive;
     }
 }

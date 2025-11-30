@@ -1,6 +1,7 @@
 package io.github.shangor.lan.transfer.core.model;
 
 import java.nio.file.Path;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicLong;
@@ -71,5 +72,13 @@ public class TransferTask {
 
     public Instant getUpdatedAt() {
         return updatedAt;
+    }
+
+    public Duration getDuration() {
+        Instant end = updatedAt;
+        if (status == TransferStatus.IN_PROGRESS || status == TransferStatus.RESENDING || status == TransferStatus.PENDING) {
+            end = Instant.now();
+        }
+        return Duration.between(createdAt, end);
     }
 }

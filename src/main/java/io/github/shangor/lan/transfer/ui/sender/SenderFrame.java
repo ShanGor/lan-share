@@ -84,6 +84,15 @@ public class SenderFrame extends JFrame {
 
         JTable table = new JTable(tableModel);
         table.getColumnModel().getColumn(2).setCellRenderer(new ProgressCellRenderer());
+        // Adjust column widths
+        table.getColumnModel().getColumn(0).setPreferredWidth(60); // Task ID
+        table.getColumnModel().getColumn(1).setPreferredWidth(80); // Status
+        table.getColumnModel().getColumn(2).setPreferredWidth(100); // Progress
+        table.getColumnModel().getColumn(3).setPreferredWidth(80); // Speed
+        table.getColumnModel().getColumn(4).setPreferredWidth(80); // Transferred
+        table.getColumnModel().getColumn(5).setPreferredWidth(80); // Total
+        table.getColumnModel().getColumn(6).setPreferredWidth(80); // Duration
+        table.getColumnModel().getColumn(7).setPreferredWidth(200); // Current File
         add(new JScrollPane(table), BorderLayout.CENTER);
 
         // Add detail panel to show current file

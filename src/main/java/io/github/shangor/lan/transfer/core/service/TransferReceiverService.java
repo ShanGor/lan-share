@@ -45,13 +45,21 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 public class TransferReceiverService implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(TransferReceiverService.class);
     private final TaskRegistry taskRegistry;
     private final TaskTableModel tableModel;
-    private final ExecutorService workerPool = Executors.newFixedThreadPool(Math.max(2, Runtime.getRuntime().availableProcessors() / 2));
+    private final ExecutorService workerPool = new ThreadPoolExecutor(
+            Math.max(2, Runtime.getRuntime().availableProcessors() / 2),
+            Math.max(2, Runtime.getRuntime().availableProcessors() / 2),
+            0L, TimeUnit.MILLISECONDS,
+            new LinkedBlockingQueue<>(50),
+            new ThreadPoolExecutor.CallerRunsPolicy()
+    );
     private final Map<Integer, ReceiverContext> contexts = new ConcurrentHashMap<>();
     private MultiThreadIoEventLoopGroup serverGroup;
     private Channel serverChannel;
