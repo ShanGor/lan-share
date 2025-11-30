@@ -60,7 +60,7 @@ Message bodies use a simple binary framing with length prefix; all multi-byte fi
 
 Data-channel messages (sent over the per-task port negotiated above):
 - `FILE_META`: sender→receiver; includes task id, entry type (F/D), relative path, file size (files), MD5 (files), file index/order.
-- `FILE_CHUNK`: sender→receiver; chunked file payloads with XOR-obscured bodies and sequence numbers.
+- `FILE_CHUNK`: sender→receiver; chunked file payloads with chunk and sequence numbers.
 - `META_ACK`: receiver→sender; confirms metadata receipt.
 - `CHUNK_ACK`: receiver→sender; selective ack ranges for received chunks.
 - `FILE_COMPLETE`: receiver→sender; acknowledges file receipt and MD5 result (OK/FAIL).

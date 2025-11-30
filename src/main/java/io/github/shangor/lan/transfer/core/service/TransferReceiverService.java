@@ -45,7 +45,6 @@ import java.time.Instant;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -338,8 +337,8 @@ public class TransferReceiverService implements AutoCloseable {
         if (rf.isFinalizing() || rf.isFinalized()) {
             return;
         }
-        byte[] decoded = xor(msg.body(), msg.xorKey());
-        workerPool.execute(() -> writeChunk(ctx, msg, rf, decoded, index));
+
+        workerPool.execute(() -> writeChunk(ctx, msg, rf, msg.body(), index));
     }
 
     private void writeChunk(ReceiverContext ctx, FileChunkMessage msg, ReceiverFile rf, byte[] decoded, int index) {
@@ -430,14 +429,6 @@ public class TransferReceiverService implements AutoCloseable {
         } catch (IOException e) {
             log.warn("Failed to send message {}", msg.type(), e);
         }
-    }
-
-    private byte[] xor(byte[] data, byte key) {
-        byte[] out = new byte[data.length];
-        for (int i = 0; i < data.length; i++) {
-            out[i] = (byte) (data[i] ^ key);
-        }
-        return out;
     }
 
     @Override
