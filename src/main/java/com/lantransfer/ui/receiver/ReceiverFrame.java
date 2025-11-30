@@ -6,6 +6,8 @@ import com.lantransfer.core.util.UserPreferences;
 import com.lantransfer.core.util.UserPreferences.ReceiverSettings;
 import com.lantransfer.ui.common.ProgressCellRenderer;
 import com.lantransfer.ui.common.TaskTableModel;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.swing.JButton;
 import javax.swing.JFileChooser;
@@ -24,8 +26,11 @@ import java.awt.Insets;
 import java.nio.file.Path;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
+import java.util.logging.LogManager;
 
 public class ReceiverFrame extends JFrame {
+    private static final Logger logger = LoggerFactory.getLogger(ReceiverFrame.class);
+
     private final TaskRegistry taskRegistry = new TaskRegistry();
     private final TaskTableModel tableModel = new TaskTableModel();
     private final TransferReceiverService receiverService = new TransferReceiverService(taskRegistry, tableModel);
@@ -33,6 +38,16 @@ public class ReceiverFrame extends JFrame {
 
     public ReceiverFrame() {
         super("Lan Transfer - Receiver");
+
+        // Initialize receiver-specific logging
+        try {
+            LogManager.getLogManager().readConfiguration(
+                ReceiverFrame.class.getResourceAsStream("/receiver-logging.properties")
+            );
+            logger.info("Receiver logging initialized");
+        } catch (Exception e) {
+            System.err.println("Failed to load receiver logging configuration: " + e.getMessage());
+        }
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         setLayout(new BorderLayout());
 
@@ -106,22 +121,30 @@ public class ReceiverFrame extends JFrame {
         }).start();
 
         browseButton.addActionListener(e -> {
+            logger.debug("Browse button clicked");
             JFileChooser chooser = new JFileChooser();
             chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
             if (chooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
-                destField.setText(chooser.getSelectedFile().getAbsolutePath());
+                String selectedPath = chooser.getSelectedFile().getAbsolutePath();
+                destField.setText(selectedPath);
+                logger.info("Destination folder selected: {}", selectedPath);
+            } else {
+                logger.debug("Browse action cancelled");
             }
         });
 
         listenButton.addActionListener(e -> {
+            logger.info("Start listening button clicked");
             String portText = portField.getText().trim();
             String dest = destField.getText().trim();
             if (portText.isEmpty() || dest.isEmpty()) {
+                logger.warn("Validation failed: port or destination empty");
                 JOptionPane.showMessageDialog(this, "Port and destination folder are required.", "Validation", JOptionPane.WARNING_MESSAGE);
                 return;
             }
             try {
                 int port = Integer.parseInt(portText);
+                logger.info("Starting receiver service on port {} with destination {}", port, dest);
                 receiverService.start(port, Path.of(dest));
                 listenButton.setEnabled(false);
                 stopButton.setEnabled(true);
@@ -129,17 +152,27 @@ public class ReceiverFrame extends JFrame {
                 browseButton.setEnabled(false);
                 statusLabel.setText("Status: Listening on port " + port);
                 UserPreferences.saveReceiverSettings(new ReceiverSettings(port, dest));
+                logger.info("Receiver service started successfully");
             } catch (NumberFormatException ex) {
+                logger.warn("Invalid port number: {}", portText);
                 JOptionPane.showMessageDialog(this, "Port must be a number.", "Validation", JOptionPane.WARNING_MESSAGE);
             } catch (InterruptedException ex) {
+                logger.error("Start listening interrupted", ex);
                 Thread.currentThread().interrupt();
             } catch (Exception ex) {
+                logger.error("Failed to start listening", ex);
                 JOptionPane.showMessageDialog(this, "Failed to start listening: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
             }
         });
 
         stopButton.addActionListener(e -> {
-            receiverService.close();
+            logger.info("Stop listening button clicked");
+            try {
+                receiverService.close();
+                logger.info("Receiver service stopped");
+            } catch (Exception ex) {
+                logger.error("Error stopping receiver service", ex);
+            }
             listenButton.setEnabled(true);
             stopButton.setEnabled(false);
             portField.setEnabled(true);

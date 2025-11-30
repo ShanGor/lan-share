@@ -6,6 +6,8 @@ import com.lantransfer.ui.common.ProgressCellRenderer;
 import com.lantransfer.ui.common.TaskTableModel;
 import com.lantransfer.core.util.UserPreferences;
 import com.lantransfer.core.util.UserPreferences.SenderSettings;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.swing.JButton;
 import javax.swing.JFileChooser;
@@ -25,14 +27,27 @@ import java.net.InetSocketAddress;
 import java.nio.file.Path;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
+import java.util.logging.LogManager;
 
 public class SenderFrame extends JFrame {
+    private static final Logger logger = LoggerFactory.getLogger(SenderFrame.class);
+
     private final TaskRegistry taskRegistry = new TaskRegistry();
     private final TaskTableModel tableModel = new TaskTableModel();
     private final TransferSenderService senderService = new TransferSenderService(taskRegistry, tableModel);
 
     public SenderFrame() {
         super("Lan Transfer - Sender");
+
+        // Initialize sender-specific logging
+        try {
+            LogManager.getLogManager().readConfiguration(
+                SenderFrame.class.getResourceAsStream("/sender-logging.properties")
+            );
+            logger.info("Sender logging initialized");
+        } catch (Exception e) {
+            System.err.println("Failed to load sender logging configuration: " + e.getMessage());
+        }
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         setLayout(new BorderLayout());
 
@@ -109,27 +124,40 @@ public class SenderFrame extends JFrame {
         senderService.start(0); // QUIC client no bind needed
 
         browseButton.addActionListener(e -> {
+            logger.debug("Browse button clicked");
             JFileChooser chooser = new JFileChooser();
             chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
             if (chooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
-                folderField.setText(chooser.getSelectedFile().getAbsolutePath());
+                String selectedPath = chooser.getSelectedFile().getAbsolutePath();
+                folderField.setText(selectedPath);
+                logger.info("Source folder selected: {}", selectedPath);
+            } else {
+                logger.debug("Browse action cancelled");
             }
         });
 
         sendButton.addActionListener(e -> {
+            logger.info("Send button clicked");
             String host = hostField.getText().trim();
             String portText = portField.getText().trim();
             String folder = folderField.getText().trim();
             if (host.isEmpty() || portText.isEmpty() || folder.isEmpty()) {
+                logger.warn("Validation failed: host, port, or folder empty");
                 JOptionPane.showMessageDialog(this, "Host, port, and folder are required.", "Validation", JOptionPane.WARNING_MESSAGE);
                 return;
             }
             try {
                 int port = Integer.parseInt(portText);
+                logger.info("Starting transfer to {}:{} from folder {}", host, port, folder);
                 senderService.sendFolder(Path.of(folder), new InetSocketAddress(host, port), tableModel);
                 UserPreferences.saveSenderSettings(new SenderSettings(host, port, folder));
+                logger.info("Transfer initiated successfully");
             } catch (NumberFormatException ex) {
+                logger.warn("Invalid port number: {}", portText);
                 JOptionPane.showMessageDialog(this, "Port must be a number.", "Validation", JOptionPane.WARNING_MESSAGE);
+            } catch (Exception ex) {
+                logger.error("Failed to start transfer", ex);
+                JOptionPane.showMessageDialog(this, "Failed to start transfer: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
             }
         });
 
@@ -138,7 +166,13 @@ public class SenderFrame extends JFrame {
         addWindowListener(new WindowAdapter() {
             @Override
             public void windowClosing(WindowEvent e) {
-                senderService.close();
+                logger.info("Sender window closing");
+                try {
+                    senderService.close();
+                    logger.info("Sender service closed");
+                } catch (Exception ex) {
+                    logger.error("Error closing sender service", ex);
+                }
             }
         });
     }

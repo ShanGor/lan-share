@@ -17,6 +17,8 @@ import com.lantransfer.core.protocol.TaskCompleteMessage;
 import com.lantransfer.core.protocol.TransferOfferMessage;
 import com.lantransfer.core.protocol.TransferResponseMessage;
 import com.lantransfer.ui.common.TaskTableModel;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.*;
 import io.netty.channel.MultiThreadIoEventLoopGroup;
@@ -49,11 +51,9 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.logging.Level;
-import java.util.logging.Logger;
 
 public class TransferReceiverService implements AutoCloseable {
-    private static final Logger log = Logger.getLogger(TransferReceiverService.class.getName());
+    private static final Logger log = LoggerFactory.getLogger(TransferReceiverService.class);
     private final TaskRegistry taskRegistry;
     private final TaskTableModel tableModel;
     private final ExecutorService workerPool = Executors.newFixedThreadPool(Math.max(2, Runtime.getRuntime().availableProcessors() / 2));
@@ -140,13 +140,13 @@ public class TransferReceiverService implements AutoCloseable {
                              ", Bytes: " + offer.totalBytes());
                     onOffer(channel, offer);
                 }
-                case FILE_META, FILE_CHUNK -> log.fine("Ignoring data message on control channel");
+                case FILE_META, FILE_CHUNK -> log.debug("Ignoring data message on control channel");
                 case TASK_CANCEL -> onTaskCancel((TaskCancelMessage) msg);
                 case CHUNK_ACK -> { /* ignore */ }
-                default -> log.fine("Ignoring message " + msg.type());
+                default -> log.debug("Ignoring message " + msg.type());
             }
         } catch (Exception e) {
-            log.log(Level.WARNING, "Error handling message " + msg.type(), e);
+            log.warn("Error handling message {}", msg.type(), e);
         }
     }
 
@@ -170,10 +170,10 @@ public class TransferReceiverService implements AutoCloseable {
                 case CHUNK_ACK, TRANSFER_RESPONSE, TRANSFER_OFFER -> {
                     // ignore on data channel
                 }
-                default -> log.fine("Ignoring data message " + msg.type());
+                default -> log.debug("Ignoring data message " + msg.type());
             }
         } catch (Exception e) {
-            log.log(Level.WARNING, "Error handling data message " + msg.type(), e);
+            log.warn("Error handling data message {}", msg.type(), e);
         }
     }
 
@@ -208,7 +208,7 @@ public class TransferReceiverService implements AutoCloseable {
                 log.info("Dialog result: " + (accept ? "ACCEPTED" : "REJECTED"));
                 channel.eventLoop().execute(() -> handleOfferDecision(channel, offer, accept));
             } catch (Exception e) {
-                log.log(Level.SEVERE, "Error in onOffer UI task", e);
+                log.error("Error in onOffer UI task", e);
             }
         };
         if (SwingUtilities.isEventDispatchThread()) {
@@ -235,7 +235,7 @@ public class TransferReceiverService implements AutoCloseable {
             contexts.put(offer.taskId(), ctx);
             sendUnchecked(channel, new TransferResponseMessage(offer.taskId(), true, dataPort));
         } catch (Exception e) {
-            log.log(Level.SEVERE, "Failed to start data server for task " + offer.taskId(), e);
+            log.error("Failed to start data server for task {}", offer.taskId(), e);
             sendUnchecked(channel, new TransferResponseMessage(offer.taskId(), false, 0));
             ctx.cleanup();
         }
@@ -254,16 +254,16 @@ public class TransferReceiverService implements AutoCloseable {
         log.info("FILE_META: Processing for taskId: " + msg.taskId() + ", fileId: " + msg.fileId() + ", path: " + msg.relativePath() + ", size: " + msg.size());
         ReceiverContext ctx = contexts.get(msg.taskId());
         if (ctx == null) {
-            log.warning("FILE_META: No context found for taskId: " + msg.taskId());
+            log.warn("FILE_META: No context found for taskId: {}", msg.taskId());
             return;
         }
         if (ctx.dataChannel != channel) {
-            log.warning("FILE_META: Ignoring for task " + msg.taskId() + " from unexpected channel.");
+            log.warn("FILE_META: Ignoring for task {} from unexpected channel.", msg.taskId());
             return;
         }
         Path target = destinationRoot.resolve(msg.relativePath()).normalize();
         if (!target.startsWith(destinationRoot)) {
-            log.warning("Rejected path outside destination: " + target);
+            log.warn("Rejected path outside destination: {}", target);
             return;
         }
 
@@ -340,9 +340,9 @@ public class TransferReceiverService implements AutoCloseable {
             ctx.task.addBytesTransferred(decoded.length);
             ctx.maybeRefreshUI(tableModel);
         } catch (ClosedChannelException e) {
-            log.log(Level.FINE, "Channel closed while writing chunk " + msg.chunkSeq() + ", ignoring duplicate");
+            log.debug("Channel closed while writing chunk {}, ignoring duplicate", msg.chunkSeq());
         } catch (IOException e) {
-            log.log(Level.WARNING, "Write failed for chunk " + msg.chunkSeq(), e);
+            log.warn("Write failed for chunk {}", msg.chunkSeq(), e);
             ctx.task.setStatus(TransferStatus.RESENDING);
             return;
         }
@@ -356,7 +356,7 @@ public class TransferReceiverService implements AutoCloseable {
         try {
             rf.forceWrites();
         } catch (IOException e) {
-            log.log(Level.FINE, "Failed to flush writes before verification for " + rf.tempFile, e);
+            log.debug("Failed to flush writes before verification for {}", rf.tempFile, e);
         }
         try {
             if (!Files.exists(rf.tempFile)) {
@@ -386,21 +386,21 @@ public class TransferReceiverService implements AutoCloseable {
                         }
                     }
                 } else {
-                    log.log(Level.WARNING, "Failed to move file after retries: " + rf.tempFile + " -> " + rf.target);
+                    log.warn("Failed to move file after retries: {} -> {}", rf.tempFile, rf.target);
                     ctx.task.setStatus(TransferStatus.FAILED);
                 }
             } else {
                 ctx.task.setStatus(TransferStatus.RESENDING);
             }
         } catch (IOException e) {
-            log.log(Level.WARNING, "Failed to verify file", e);
+            log.warn("Failed to verify file", e);
         } finally {
             ctx.files.remove(fileId);
             rf.markFinalized();
             try {
                 rf.closeChannel();
             } catch (IOException e) {
-                log.log(Level.FINE, "Failed to close channel after verification for " + rf.tempFile, e);
+                log.debug("Failed to close channel after verification for {}", rf.tempFile, e);
             }
         }
     }
@@ -418,7 +418,7 @@ public class TransferReceiverService implements AutoCloseable {
             // Reduced logging
             QuicMessageUtil.write(channel, msg);
         } catch (IOException e) {
-            log.log(Level.WARNING, "Failed to send message " + msg.type(), e);
+            log.warn("Failed to send message {}", msg.type(), e);
         }
     }
 
@@ -453,7 +453,7 @@ public class TransferReceiverService implements AutoCloseable {
                 return true; // Success
             } catch (IOException e) {
                 if (i == maxRetries - 1) { // Last attempt
-                    log.log(Level.WARNING, "Failed to move file after " + maxRetries + " attempts: " + source + " -> " + target, e);
+                    log.warn("Failed to move file after {} attempts: {} -> {}", maxRetries, source, target, e);
                     return false;
                 }
                 // Wait before retry
@@ -658,7 +658,7 @@ public class TransferReceiverService implements AutoCloseable {
             try {
                 closeChannel();
             } catch (IOException e) {
-                log.log(Level.FINE, "Failed to close receiver file channel for " + tempFile, e);
+                log.debug("Failed to close receiver file channel for {}", tempFile, e);
             }
         }
 

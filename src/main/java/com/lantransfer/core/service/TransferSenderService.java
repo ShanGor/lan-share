@@ -16,6 +16,8 @@ import com.lantransfer.core.protocol.TaskCompleteMessage;
 import com.lantransfer.core.protocol.TransferOfferMessage;
 import com.lantransfer.core.protocol.TransferResponseMessage;
 import com.lantransfer.ui.common.TaskTableModel;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelInitializer;
@@ -50,11 +52,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.logging.Level;
-import java.util.logging.Logger;
-
 public class TransferSenderService implements AutoCloseable {
-    private static final Logger log = Logger.getLogger(TransferSenderService.class.getName());
+    private static final Logger log = LoggerFactory.getLogger(TransferSenderService.class);
 
     private final TaskRegistry taskRegistry;
     private final TaskTableModel tableModel;
@@ -110,7 +109,7 @@ public class TransferSenderService implements AutoCloseable {
             ensureControlChannel(ctx);
             sendControl(ctx, new TransferOfferMessage(taskId, folder.getFileName().toString(), totalBytes, files.size() + dirs.size(), 0, 'D'));
         } catch (Exception e) {
-            log.log(Level.SEVERE, "Send failed", e);
+            log.error("Send failed", e);
             if (ctx != null) {
                 ctx.task.setStatus(TransferStatus.FAILED);
                 contexts.remove(taskId);
@@ -123,10 +122,10 @@ public class TransferSenderService implements AutoCloseable {
 
     private void ensureControlChannel(SenderContext ctx) throws Exception {
         if (ctx.controlStreamChannel != null && ctx.controlStreamChannel.isActive()) {
-            log.info("Control channel already active for task " + ctx.taskId);
+            log.info("Control channel already active for task {}", ctx.taskId);
             return;
         }
-        log.info("Establishing control channel to receiver: " + ctx.receiver);
+        log.info("Establishing control channel to receiver: {}", ctx.receiver);
         Bootstrap bootstrap = new Bootstrap();
         Channel udpChannel = bootstrap.group(quicGroup)
                 .channel(NioDatagramChannel.class)
@@ -139,7 +138,7 @@ public class TransferSenderService implements AutoCloseable {
                 .bind(0)
                 .sync()
                 .channel();
-        log.info("UDP channel bound to: " + udpChannel.localAddress());
+        log.info("UDP channel bound to: {}", udpChannel.localAddress());
 
         QuicChannelBootstrap quicBootstrap = QuicChannel.newBootstrap(udpChannel)
                 .remoteAddress(ctx.receiver)
@@ -149,7 +148,7 @@ public class TransferSenderService implements AutoCloseable {
                         // no-op; we explicitly create streams
                     }
                 });
-        log.info("Attempting QUIC connection to: " + ctx.receiver);
+        log.info("Attempting QUIC connection to: {}", ctx.receiver);
         try {
             QuicChannel quicChannel = quicBootstrap.connect().get(15, TimeUnit.SECONDS);
             log.info("QUIC connection established successfully");
@@ -167,17 +166,17 @@ public class TransferSenderService implements AutoCloseable {
             ctx.controlUdpChannel = udpChannel;
             ctx.controlQuicChannel = quicChannel;
             ctx.controlStreamChannel = streamChannel;
-            log.info("Control stream created successfully for task " + ctx.taskId);
+            log.info("Control stream created successfully for task {}", ctx.taskId);
             streamChannel.closeFuture().addListener(f -> {
-                log.info("Control stream closed for task " + ctx.taskId);
+                log.info("Control stream closed for task {}", ctx.taskId);
                 if (f.cause() != null) {
-                    log.log(Level.WARNING, "Control stream closed with error", f.cause());
+                    log.warn("Control stream closed with error", f.cause());
                 }
                 contexts.remove(ctx.taskId);
                 ctx.cleanup();
             });
         } catch (Exception e) {
-            log.log(Level.SEVERE, "Failed to establish QUIC connection to " + ctx.receiver, e);
+            log.error("Failed to establish QUIC connection to {}", ctx.receiver, e);
             throw e;
         }
     }
@@ -300,7 +299,7 @@ public class TransferSenderService implements AutoCloseable {
                 }
                 sendData(ctx, msg);
             } catch (IOException e) {
-                log.log(Level.WARNING, "Failed to resend FILE_META for fileId " + fileId, e);
+                log.warn("Failed to resend FILE_META for fileId {}", fileId, e);
             }
         }, 1000, 2000, TimeUnit.MILLISECONDS); // Retry after 1s, then every 2s
 
@@ -315,7 +314,7 @@ public class TransferSenderService implements AutoCloseable {
             case FILE_COMPLETE -> onFileComplete((FileCompleteMessage) msg);
             case META_ACK -> onMetaAck(ctx, (MetaAckMessage) msg);
             case TASK_COMPLETE -> onTaskComplete((TaskCompleteMessage) msg);
-            default -> log.warning("Unknown data message type: " + msg.type());
+            default -> log.warn("Unknown data message type: {}", msg.type());
         }
     }
 
@@ -327,7 +326,7 @@ public class TransferSenderService implements AutoCloseable {
                 contexts.remove(ctx.taskId);
                 ctx.cleanup();
             }
-            default -> log.fine("Ignoring control message " + msg.type());
+            default -> log.debug("Ignoring control message " + msg.type());
         }
     }
 
@@ -350,7 +349,7 @@ public class TransferSenderService implements AutoCloseable {
                 ctx.task.setStatus(TransferStatus.IN_PROGRESS);
                 sendEntries(ctx);
             } catch (Exception e) {
-                log.log(Level.SEVERE, "Failed to send entries for task " + ctx.taskId, e);
+                log.error("Failed to send entries for task {}", ctx.taskId, e);
                 ctx.task.setStatus(TransferStatus.FAILED);
                 contexts.remove(ctx.taskId);
                 ctx.cleanup();
@@ -373,10 +372,14 @@ public class TransferSenderService implements AutoCloseable {
         }
         SenderEntry entry = ctx.entries.get(fileId);
         if (entry != null) {
-            log.info("META_ACK: Starting file streaming for fileId: " + fileId + " for taskId: " + ctx.taskId);
-            startFileStreaming(ctx, fileId, entry);
+            if (entry.isDirectory()) {
+                log.info("META_ACK: Directory confirmed, skipping streaming for fileId: {} for taskId: {}", fileId, ctx.taskId);
+            } else {
+                log.info("META_ACK: Starting file streaming for fileId: " + fileId + " for taskId: " + ctx.taskId);
+                startFileStreaming(ctx, fileId, entry);
+            }
         } else {
-            log.warning("META_ACK: No entry found for fileId: " + fileId + " for taskId: " + ctx.taskId);
+            log.warn("META_ACK: No entry found for fileId: {} for taskId: {}", fileId, ctx.taskId);
         }
     }
 
@@ -385,7 +388,7 @@ public class TransferSenderService implements AutoCloseable {
         try {
             state = ctx.ensureFileState(fileId, entry);
         } catch (IOException e) {
-            log.log(Level.SEVERE, "Failed to open file channel for streaming: " + entry.path(), e);
+            log.error("Failed to open file channel for streaming: {}", entry.path(), e);
             ctx.task.setStatus(TransferStatus.FAILED);
             return;
         }
@@ -418,7 +421,7 @@ public class TransferSenderService implements AutoCloseable {
             }
             log.info("Finished streaming for fileId: " + state.fileId);
         } catch (IOException e) {
-            log.log(Level.WARNING, "Failed to stream file " + state.path, e);
+            log.warn("Failed to stream file {}", state.path, e);
             ctx.task.setStatus(TransferStatus.FAILED);
             failContext(ctx);
         }
@@ -457,7 +460,7 @@ public class TransferSenderService implements AutoCloseable {
                 sendControl(ctx, new TaskCancelMessage(taskId));
                 ctx.task.setStatus(TransferStatus.CANCELED);
             } catch (IOException e) {
-                log.log(Level.WARNING, "Failed to send task cancel message", e);
+                log.warn("Failed to send task cancel message", e);
                 ctx.task.setStatus(TransferStatus.CANCELED);
             }
             ctx.cleanup();
@@ -516,7 +519,7 @@ public class TransferSenderService implements AutoCloseable {
 
     private void writeToChannel(SenderContext ctx, QuicStreamChannel channel, String channelType, ProtocolMessage msg) throws IOException {
         if (channel == null || !channel.isActive()) {
-            log.warning("WRITE_CHANNEL: Channel not active for " + channelType + " channel, taskId: " + ctx.taskId);
+            log.warn("WRITE_CHANNEL: Channel not active for {} channel, taskId: {}", channelType, ctx.taskId);
             throw new IOException("Channel not active for " + channelType + " channel");
         }
         // Reduced logging for performance
@@ -607,7 +610,7 @@ public class TransferSenderService implements AutoCloseable {
                 try {
                     state.close();
                 } catch (IOException e) {
-                    log.log(Level.FINE, "Failed to close channel for fileId " + fileId, e);
+                    log.debug("Failed to close channel for fileId {}", fileId, e);
                 }
             }
         }
@@ -619,7 +622,7 @@ public class TransferSenderService implements AutoCloseable {
                 try {
                     state.close();
                 } catch (IOException e) {
-                    log.log(Level.FINE, "Failed to close sender file state", e);
+                    log.debug("Failed to close sender file state", e);
                 }
             });
             fileStates.clear();
