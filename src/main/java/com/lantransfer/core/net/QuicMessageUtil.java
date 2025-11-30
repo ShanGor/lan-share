@@ -49,9 +49,6 @@ public final class QuicMessageUtil {
         ByteBuf buf = channel.alloc().buffer(4 + data.length);
         buf.writeInt(data.length);
         buf.writeBytes(data);
-        System.out.println("DEBUG: Writing " + message.type() + " to channel " + channel +
-                         ", data length: " + data.length + ", channel active: " + channel.isActive());
         channel.writeAndFlush(buf);
-        System.out.println("DEBUG: Write completed for " + message.type());
     }
 }

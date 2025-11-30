@@ -11,7 +11,7 @@ import java.util.Map;
 
 public class TaskTableModel extends AbstractTableModel {
     private final List<TransferTask> tasks = new ArrayList<>();
-    private final String[] columns = {"Task ID", "Status", "Progress", "Speed (KB/s)", "Transferred", "Total", "RTT (ms)", "Window"};
+    private final String[] columns = {"Task ID", "Status", "Progress", "Speed (KB/s)", "Transferred", "Total", "Current File"};
     private final Map<String, Long> lastBytes = new HashMap<>();
     private final Map<String, Long> lastTimes = new HashMap<>();
     private final Map<String, Double> speeds = new HashMap<>();
@@ -37,8 +37,7 @@ public class TaskTableModel extends AbstractTableModel {
     @Override
     public Class<?> getColumnClass(int columnIndex) {
         return switch (columnIndex) {
-            case 2, 3, 6 -> Double.class;
-            case 7 -> Integer.class;
+            case 2, 3 -> Double.class;
             default -> String.class;
         };
     }
@@ -53,8 +52,7 @@ public class TaskTableModel extends AbstractTableModel {
             case 3 -> speed(task);
             case 4 -> formatBytes(task.getBytesTransferred());
             case 5 -> formatBytes(task.getTotalBytes());
-            case 6 -> rtts.getOrDefault(task.getTaskId(), 0d);
-            case 7 -> windows.getOrDefault(task.getTaskId(), 0);
+            case 6 -> currentFileMap.getOrDefault(task.getTaskId(), "");
             default -> "";
         };
     }

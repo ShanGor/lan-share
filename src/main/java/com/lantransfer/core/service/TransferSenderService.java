@@ -3,8 +3,8 @@ package com.lantransfer.core.service;
 import com.lantransfer.core.model.TransferStatus;
 import com.lantransfer.core.model.TransferTask;
 import com.lantransfer.core.net.QuicMessageUtil;
+import com.lantransfer.core.protocol.ProtocolIO;
 import com.lantransfer.core.protocol.ChunkAckMessage;
-import com.lantransfer.core.protocol.ChunkAckMessage.AckRange;
 import com.lantransfer.core.protocol.ChunkHeader;
 import com.lantransfer.core.protocol.FileChunkMessage;
 import com.lantransfer.core.protocol.FileCompleteMessage;
@@ -41,7 +41,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -56,14 +55,6 @@ import java.util.logging.Logger;
 
 public class TransferSenderService implements AutoCloseable {
     private static final Logger log = Logger.getLogger(TransferSenderService.class.getName());
-    private static final int INITIAL_WINDOW_CHUNKS = 64;
-    private static final int MAX_WINDOW_CHUNKS = 1024;
-    private static final int MIN_WINDOW_CHUNKS = 8;
-    private static final int TIMEOUT_SWEEP_INTERVAL_MS = 25;
-    private static final long MIN_CHUNK_TIMEOUT_MS = 50;
-    private static final long MAX_CHUNK_TIMEOUT_MS = 2000;
-    private static final long RTT_GRANULARITY_MS = 5;
-    private static final int MAX_CHUNK_RETRY = 8; // Increased to handle more retries with faster requests
 
     private final TaskRegistry taskRegistry;
     private final TaskTableModel tableModel;
@@ -179,6 +170,9 @@ public class TransferSenderService implements AutoCloseable {
             log.info("Control stream created successfully for task " + ctx.taskId);
             streamChannel.closeFuture().addListener(f -> {
                 log.info("Control stream closed for task " + ctx.taskId);
+                if (f.cause() != null) {
+                    log.log(Level.WARNING, "Control stream closed with error", f.cause());
+                }
                 contexts.remove(ctx.taskId);
                 ctx.cleanup();
             });
@@ -203,19 +197,19 @@ public class TransferSenderService implements AutoCloseable {
                         .maxIdleTimeout(TimeUnit.HOURS.toMillis(12), TimeUnit.MILLISECONDS)
                         .initialMaxData(10_000_000)
                         .initialMaxStreamDataBidirectionalLocal(1_000_000)
+                        .initialMaxStreamDataBidirectionalRemote(1_000_000)
+                        .initialMaxStreamsBidirectional(100)
                         .build())
                 .bind(0)
                 .sync()
                 .channel();
 
-    QuicChannelBootstrap quicBootstrap = QuicChannel.newBootstrap(udpChannel)
+        QuicChannelBootstrap quicBootstrap = QuicChannel.newBootstrap(udpChannel)
                 .remoteAddress(dataAddress)
-                .streamHandler(new ChannelInitializer<QuicStreamChannel>() {
+                .handler(new ChannelInitializer<QuicChannel>() {
                     @Override
-                    protected void initChannel(QuicStreamChannel ch) {
-                        ch.pipeline().addLast(QuicMessageUtil.newFrameDecoder());
-                        ch.pipeline().addLast(QuicMessageUtil.newInboundHandler((channel, message) ->
-                                handleDataMessage(ctx, message)));
+                    protected void initChannel(QuicChannel ch) {
+                        log.info("Data QUIC channel initialized: " + ch);
                     }
                 });
         log.info("Attempting QUIC data connection to: " + dataAddress);
@@ -225,10 +219,13 @@ public class TransferSenderService implements AutoCloseable {
                 new ChannelInitializer<QuicStreamChannel>() {
                     @Override
                     protected void initChannel(QuicStreamChannel ch) {
-                        log.info("Data stream created: " + ch);
+                        log.info("Data stream created: " + ch + " for taskId: " + ctx.taskId);
                         ch.pipeline().addLast(QuicMessageUtil.newFrameDecoder());
-                        ch.pipeline().addLast(QuicMessageUtil.newInboundHandler((channel, message) ->
-                                handleDataMessage(ctx, message)));
+                        ch.pipeline().addLast(QuicMessageUtil.newInboundHandler((channel, message) -> {
+                            log.info("Data channel received message: " + message.type() + " for taskId: " + ctx.taskId);
+                            handleDataMessage(ctx, message);
+                        }));
+                        log.info("Data stream pipeline configured for taskId: " + ctx.taskId);
                     }
                 });
         streamFuture.sync();
@@ -271,8 +268,13 @@ public class TransferSenderService implements AutoCloseable {
             ctx.currentFilePath = entry.path().toString();
             ctx.maybeRefreshUI(tableModel);
         }
-        log.info("Sending FILE_META for taskId: " + taskId + ", fileId: " + fileId +
-                 ", path: " + relPath + ", acknowledged: " + Boolean.TRUE.equals(ctx.fileMetaAcked.get(fileId)));
+        
+        // Check data channel state before sending
+        log.info("FILE_META: Preparing to send for taskId: " + taskId + ", fileId: " + fileId +
+                 ", path: " + relPath + ", dataChannel: " + ctx.dataStreamChannel + 
+                 ", dataChannel active: " + (ctx.dataStreamChannel != null && ctx.dataStreamChannel.isActive()) +
+                 ", acknowledged: " + Boolean.TRUE.equals(ctx.fileMetaAcked.get(fileId)));
+        
         sendData(ctx, msg);
 
         // Track that FILE_META was sent and schedule retry if no ACK received
@@ -287,7 +289,8 @@ public class TransferSenderService implements AutoCloseable {
                 return;
             }
             // Still not acknowledged, retry sending FILE_META
-            log.info("FILE_META for fileId " + fileId + " not acknowledged yet, retrying...");
+            log.info("FILE_META for fileId " + fileId + " not acknowledged yet, retrying... Data channel active: " + 
+                    (ctx.dataStreamChannel != null && ctx.dataStreamChannel.isActive()));
             try {
                 // Update current file path for UI during retries
                 SenderEntry retryEntry = ctx.entries.get(fileId);
@@ -306,13 +309,13 @@ public class TransferSenderService implements AutoCloseable {
     }
 
     private void handleDataMessage(SenderContext ctx, ProtocolMessage msg) {
-        log.info("Received data message: " + msg.type() + " for taskId: " + ctx.taskId);
+        log.info("HANDLE_DATA: Received " + msg.type() + " message for taskId: " + ctx.taskId);
         switch (msg.type()) {
-            case CHUNK_ACK -> onChunkAck(ctx, (ChunkAckMessage) msg);
+            case CHUNK_ACK -> { /* Ignore, we rely on QUIC reliability */ }
             case FILE_COMPLETE -> onFileComplete((FileCompleteMessage) msg);
             case META_ACK -> onMetaAck(ctx, (MetaAckMessage) msg);
             case TASK_COMPLETE -> onTaskComplete((TaskCompleteMessage) msg);
-            default -> log.fine("Ignoring message " + msg.type());
+            default -> log.warning("Unknown data message type: " + msg.type());
         }
     }
 
@@ -355,54 +358,25 @@ public class TransferSenderService implements AutoCloseable {
         });
     }
 
-    private void onChunkAck(SenderContext ctx, ChunkAckMessage msg) {
-        SenderFileState state = ctx.fileStates.get(msg.fileId());
-        if (state == null) return;
-        boolean shouldSendMore = false;
-        long rttSampleNanos = -1;
-        synchronized (state.lock) {
-            if (state.closed) {
-                return;
-            }
-            if (msg.ranges() != null) {
-                for (AckRange range : msg.ranges()) {
-                    for (long seq = range.start(); seq <= range.end(); seq++) {
-                        Long sentAt = state.inFlight.remove(seq);
-                        if (sentAt != null) {
-                            state.retryCount.remove(seq);
-                            state.onAck();
-                            if (rttSampleNanos < 0) {
-                                rttSampleNanos = System.nanoTime() - sentAt;
-                            }
-                        }
-                    }
-                }
-            }
-            if (state.inFlight.size() < state.windowLimit() && state.nextSeq < state.totalChunks) {
-                shouldSendMore = true;
-            }
-        }
-        if (rttSampleNanos > 0) {
-            ctx.updateRtt(rttSampleNanos);
-        }
-        if (shouldSendMore) {
-            sendNextChunks(ctx, msg.fileId());
-        }
-    }
-
     private void onMetaAck(SenderContext ctx, MetaAckMessage msg) {
-        log.info("Received META_ACK for taskId: " + ctx.taskId + ", fileId: " + msg.fileId());
-        // Mark that FILE_META for this file ID has been acknowledged
-        ctx.fileMetaAcked.put(msg.fileId(), true);
-        log.info("Marked file " + msg.fileId() + " as acknowledged");
-        // Cancel any pending retries for this file meta
-        ScheduledFuture<?> retryFuture = ctx.chunkTimeouts.remove(-msg.fileId()); // using negative fileId as key for meta retries
-        if (retryFuture != null) {
-            retryFuture.cancel(false);
+        int fileId = msg.fileId();
+        log.info("META_ACK: Received acknowledgment for fileId: " + fileId + " for taskId: " + ctx.taskId);
+        Boolean acked = ctx.fileMetaAcked.put(fileId, true);
+        if (Boolean.TRUE.equals(acked)) {
+            log.info("META_ACK: FileId " + fileId + " already acknowledged for taskId: " + ctx.taskId);
+            return; // Already acknowledged
         }
-        SenderEntry entry = ctx.entries.get(msg.fileId());
-        if (entry != null && !entry.isDirectory()) {
-            startFileStreaming(ctx, msg.fileId(), entry);
+        ScheduledFuture<?> future = ctx.chunkTimeouts.remove(-fileId);
+        if (future != null) {
+            future.cancel(false);
+            log.info("META_ACK: Cancelled retry timeout for fileId: " + fileId + " for taskId: " + ctx.taskId);
+        }
+        SenderEntry entry = ctx.entries.get(fileId);
+        if (entry != null) {
+            log.info("META_ACK: Starting file streaming for fileId: " + fileId + " for taskId: " + ctx.taskId);
+            startFileStreaming(ctx, fileId, entry);
+        } else {
+            log.warning("META_ACK: No entry found for fileId: " + fileId + " for taskId: " + ctx.taskId);
         }
     }
 
@@ -415,129 +389,38 @@ public class TransferSenderService implements AutoCloseable {
             ctx.task.setStatus(TransferStatus.FAILED);
             return;
         }
-        boolean shouldStart = false;
-        synchronized (state.lock) {
-            if (!state.closed && !state.streaming) {
-                state.streaming = true;
-                shouldStart = true;
-            }
-        }
-        if (shouldStart) {
-            ctx.currentFilePath = entry.path().toString();
-            ctx.maybeRefreshUI(tableModel);
-            scheduleChunkTimeout(ctx, fileId);
-            sendNextChunks(ctx, fileId);
-        }
+        
+        ctx.currentFilePath = entry.path().toString();
+        ctx.maybeRefreshUI(tableModel);
+        
+        // Stream the file asynchronously
+        sendExecutor.submit(() -> streamFile(ctx, state));
     }
 
-    private void scheduleChunkTimeout(SenderContext ctx, int fileId) {
-        ctx.chunkTimeouts.computeIfAbsent(fileId, id ->
-                scheduler.scheduleWithFixedDelay(() -> checkChunkTimeout(ctx, fileId),
-                        TIMEOUT_SWEEP_INTERVAL_MS, TIMEOUT_SWEEP_INTERVAL_MS, TimeUnit.MILLISECONDS));
-    }
-
-    private void checkChunkTimeout(SenderContext ctx, int fileId) {
-        SenderFileState state = ctx.fileStates.get(fileId);
-        if (state == null) return;
-        List<Long> resend = new ArrayList<>();
-        boolean fail = false;
-        boolean windowReduced = false;
-        long timeoutMs = ctx.chunkTimeoutMillis();
-        synchronized (state.lock) {
-            if (state.closed) {
-                return;
-            }
-            long now = System.nanoTime();
-            for (Map.Entry<Long, Long> entry : state.inFlight.entrySet()) {
-                long seq = entry.getKey();
-                long sentAt = entry.getValue();
-                long elapsedMs = TimeUnit.NANOSECONDS.toMillis(now - sentAt);
-                if (elapsedMs >= timeoutMs) {
-                    if (!windowReduced) {
-                        state.onTimeout();
-                        windowReduced = true;
-                    }
-                    int retry = state.retryCount.getOrDefault(seq, 0);
-                    if (retry >= MAX_CHUNK_RETRY) {
-                        fail = true;
-                        break;
-                    }
-                    state.retryCount.put(seq, retry + 1);
-                    entry.setValue(now);
-                    resend.add(seq);
-                }
-            }
-        }
-        if (fail) {
-            log.log(Level.SEVERE, "Exceeded retry limit for fileId " + fileId + " on task " + ctx.taskId);
-            ctx.task.setStatus(TransferStatus.FAILED);
-            failContext(ctx);
-            return;
-        }
-        for (long seq : resend) {
-            SenderFileState stateRef = ctx.fileStates.get(fileId);
-            if (stateRef == null) {
-                return;
-            }
-            sendChunkAsync(ctx, stateRef, seq, true);
-        }
-    }
-
-    private void sendNextChunks(SenderContext ctx, int fileId) {
-        SenderFileState state = ctx.fileStates.get(fileId);
-        if (state == null) return;
-        List<Long> toSend = new ArrayList<>();
-        synchronized (state.lock) {
-            if (state.closed) return;
-            int windowLimit = state.windowLimit();
-            while (state.inFlight.size() < windowLimit && state.nextSeq < state.totalChunks) {
-                long seq = state.nextSeq++;
-                state.inFlight.put(seq, System.nanoTime());
-                state.retryCount.put(seq, 0);
-                toSend.add(seq);
-            }
-        }
-        if (toSend.isEmpty()) {
-            return;
-        }
-        for (long seq : toSend) {
-            sendChunkAsync(ctx, state, seq, false);
-        }
-    }
-
-    private void sendChunkAsync(SenderContext ctx, SenderFileState state, long seq, boolean retransmit) {
-        sendExecutor.submit(() -> sendChunk(ctx, state, seq, retransmit));
-    }
-
-    private void sendChunk(SenderContext ctx, SenderFileState state, long seq, boolean retransmit) {
-        byte[] chunk;
-        synchronized (state.lock) {
-            if (state.closed) {
-                return;
-            }
-            ctx.currentFilePath = state.path.toString();
-        }
+    private void streamFile(SenderContext ctx, SenderFileState state) {
         try {
-            chunk = readChunk(state.channel, seq);
-        } catch (IOException e) {
-            log.log(Level.WARNING, "Failed to read chunk " + seq + " for file " + state.path, e);
-            ctx.task.setStatus(TransferStatus.FAILED);
-            failContext(ctx);
-            return;
-        }
-        if (chunk.length == 0) {
-            return;
-        }
-        byte xorKey = (byte) (System.nanoTime() & 0xFF);
-        byte[] body = xor(chunk, xorKey);
-        try {
-            sendData(ctx, new FileChunkMessage(ctx.taskId, state.fileId, seq, xorKey, body));
-            if (!retransmit) {
+            log.info("Starting streaming for fileId: " + state.fileId);
+            long seq = 0;
+            while (seq < state.totalChunks) {
+                if (state.closed) return;
+                
+                byte[] chunk = readChunk(state.channel, seq);
+                if (chunk.length == 0) break;
+                
+                byte xorKey = (byte) (System.nanoTime() & 0xFF);
+                byte[] body = xor(chunk, xorKey);
+                
+                sendData(ctx, new FileChunkMessage(ctx.taskId, state.fileId, seq, xorKey, body));
                 ctx.task.addBytesTransferred(body.length);
                 ctx.maybeRefreshUI(tableModel);
+                
+                seq++;
             }
+            log.info("Finished streaming for fileId: " + state.fileId);
         } catch (IOException e) {
-            log.log(Level.WARNING, "Failed to send chunk " + seq + " for fileId " + state.fileId, e);
+            log.log(Level.WARNING, "Failed to stream file " + state.path, e);
+            ctx.task.setStatus(TransferStatus.FAILED);
+            failContext(ctx);
         }
     }
 
@@ -623,24 +506,23 @@ public class TransferSenderService implements AutoCloseable {
     }
 
     private void sendControl(SenderContext ctx, ProtocolMessage msg) throws IOException {
-        log.info("Sending control message: " + msg.type() + " on channel " + ctx.controlStreamChannel +
-                 " is active: " + ctx.controlStreamChannel.isActive() +
-                 " is writable: " + ctx.controlStreamChannel.isWritable());
         writeToChannel(ctx, ctx.controlStreamChannel, "control", msg);
-        log.info("Control message sent successfully");
     }
 
     private void sendData(SenderContext ctx, ProtocolMessage msg) throws IOException {
+        // Reduced logging for performance
         writeToChannel(ctx, ctx.dataStreamChannel, "data", msg);
     }
 
-    private void writeToChannel(SenderContext ctx, QuicStreamChannel channel, String label, ProtocolMessage msg) throws IOException {
+    private void writeToChannel(SenderContext ctx, QuicStreamChannel channel, String channelType, ProtocolMessage msg) throws IOException {
         if (channel == null || !channel.isActive()) {
-            throw new IOException("QUIC " + label + " stream is not active for task " + ctx.taskId);
+            log.warning("WRITE_CHANNEL: Channel not active for " + channelType + " channel, taskId: " + ctx.taskId);
+            throw new IOException("Channel not active for " + channelType + " channel");
         }
-        log.info("Writing message " + msg.type() + " to " + label + " stream " + channel);
+        // Reduced logging for performance
+        byte[] data = ProtocolIO.toByteArray(msg);
+        ctx.task.addBytesTransferred(data.length);
         QuicMessageUtil.write(channel, msg);
-        log.info("Message written successfully to " + label + " stream");
     }
 
     @Override
@@ -678,11 +560,6 @@ public class TransferSenderService implements AutoCloseable {
         volatile long lastUiUpdateNanos = System.nanoTime();
         volatile long lastTelemetryLogNanos = System.nanoTime();
         volatile long lastTelemetryBytes = 0;
-        private final Object rttLock = new Object();
-        volatile long smoothedRttNanos = TimeUnit.MILLISECONDS.toNanos(150);
-        volatile long rttVarNanos = TimeUnit.MILLISECONDS.toNanos(75);
-        volatile long retransmitTimeoutNanos = TimeUnit.MILLISECONDS.toNanos(150);
-        volatile boolean rttInitialized = false;
 
         SenderContext(int taskId, TransferTask task, InetSocketAddress receiver, List<Path> files, List<Path> directories, Path root) {
             this.taskId = taskId;
@@ -704,46 +581,6 @@ public class TransferSenderService implements AutoCloseable {
                 publishTelemetry(model);
                 SwingUtilities.invokeLater(model::refresh);
             }
-        }
-
-        long chunkTimeoutMillis() {
-            long nanos = retransmitTimeoutNanos;
-            if (nanos <= 0) {
-                nanos = TimeUnit.MILLISECONDS.toNanos(MIN_CHUNK_TIMEOUT_MS);
-            }
-            long min = TimeUnit.MILLISECONDS.toNanos(MIN_CHUNK_TIMEOUT_MS);
-            long max = TimeUnit.MILLISECONDS.toNanos(MAX_CHUNK_TIMEOUT_MS);
-            long clamped = Math.max(min, Math.min(max, nanos));
-            long millis = TimeUnit.NANOSECONDS.toMillis(clamped);
-            return Math.max(MIN_CHUNK_TIMEOUT_MS, millis);
-        }
-
-        void updateRtt(long sampleNanos) {
-            if (sampleNanos <= 0) return;
-            synchronized (rttLock) {
-                if (!rttInitialized) {
-                    smoothedRttNanos = sampleNanos;
-                    rttVarNanos = sampleNanos / 2;
-                    retransmitTimeoutNanos = clampTimeout(smoothedRttNanos + smoothedRttNanos);
-                    rttInitialized = true;
-                    return;
-                }
-                long delta = sampleNanos - smoothedRttNanos;
-                smoothedRttNanos += delta / 8;
-                long absDelta = Math.abs(delta);
-                rttVarNanos += (absDelta - rttVarNanos) / 4;
-                long granularity = TimeUnit.MILLISECONDS.toNanos(RTT_GRANULARITY_MS);
-                long baseTimeout = smoothedRttNanos + Math.max(granularity, 4 * rttVarNanos);
-                retransmitTimeoutNanos = clampTimeout(baseTimeout);
-            }
-        }
-
-        private long clampTimeout(long nanos) {
-            long min = TimeUnit.MILLISECONDS.toNanos(MIN_CHUNK_TIMEOUT_MS);
-            long max = TimeUnit.MILLISECONDS.toNanos(MAX_CHUNK_TIMEOUT_MS);
-            if (nanos < min) return min;
-            if (nanos > max) return max;
-            return nanos;
         }
 
         SenderFileState ensureFileState(int fileId, SenderEntry entry) throws IOException {
@@ -815,28 +652,8 @@ public class TransferSenderService implements AutoCloseable {
         }
 
         private void publishTelemetry(TaskTableModel model) {
-            double rttMillis = currentRttMillis();
-            int window = aggregateWindowLimit();
-            model.setTelemetry(String.format("%05d", taskId), rttMillis, window);
-        }
-
-        private double currentRttMillis() {
-            if (!rttInitialized) {
-                return 0d;
-            }
-            return smoothedRttNanos / 1_000_000.0;
-        }
-
-        private int aggregateWindowLimit() {
-            return fileStates.values().stream()
-                    .mapToInt(SenderFileState::windowLimit)
-                    .sum();
-        }
-
-        private int totalInflight() {
-            return fileStates.values().stream()
-                    .mapToInt(state -> state.inFlight.size())
-                    .sum();
+            // Simplified telemetry
+            model.setTelemetry(String.format("%05d", taskId), 0, 0);
         }
 
         private void maybeLogTelemetry(long now) {
@@ -847,11 +664,8 @@ public class TransferSenderService implements AutoCloseable {
             long bytes = task.getBytesTransferred();
             double seconds = elapsed / 1_000_000_000.0;
             double mbPerSec = seconds > 0 ? ((bytes - lastTelemetryBytes) / 1_048_576.0) / seconds : 0;
-            double rtt = currentRttMillis();
-            int window = aggregateWindowLimit();
-            int inflight = totalInflight();
-            log.info(String.format("Task %05d telemetry: RTT=%.2f ms window=%d inflight=%d throughput=%.2f MB/s",
-                    taskId, rtt, window, inflight, mbPerSec));
+            log.info(String.format("Task %05d telemetry: throughput=%.2f MB/s",
+                    taskId, mbPerSec));
             lastTelemetryBytes = bytes;
             lastTelemetryLogNanos = now;
         }
@@ -864,13 +678,6 @@ public class TransferSenderService implements AutoCloseable {
         final Path path;
         final long totalChunks;
         final FileChannel channel;
-        final Object lock = new Object();
-        final Map<Long, Long> inFlight = new HashMap<>();
-        final Map<Long, Integer> retryCount = new HashMap<>();
-        int windowSlots = INITIAL_WINDOW_CHUNKS;
-        int ackSinceWindowIncrease = 0;
-        long nextSeq = 0;
-        boolean streaming = false;
         boolean closed = false;
 
         SenderFileState(int fileId, Path path, long totalChunks) throws IOException {
@@ -880,35 +687,12 @@ public class TransferSenderService implements AutoCloseable {
             this.channel = FileChannel.open(path, StandardOpenOption.READ);
         }
 
-        int windowLimit() {
-            return Math.max(MIN_WINDOW_CHUNKS, Math.min(MAX_WINDOW_CHUNKS, windowSlots));
-        }
-
-        void onAck() {
-            int limit = windowLimit();
-            if (limit >= MAX_WINDOW_CHUNKS) {
-                return;
-            }
-            ackSinceWindowIncrease++;
-            if (ackSinceWindowIncrease >= limit) {
-                windowSlots = Math.min(MAX_WINDOW_CHUNKS, windowSlots + 1);
-                ackSinceWindowIncrease = 0;
-            }
-        }
-
-        void onTimeout() {
-            windowSlots = Math.max(MIN_WINDOW_CHUNKS, windowSlots / 2);
-            ackSinceWindowIncrease = 0;
-        }
-
         @Override
         public void close() throws IOException {
-            synchronized (lock) {
-                if (closed) {
-                    return;
-                }
-                closed = true;
+            if (closed) {
+                return;
             }
+            closed = true;
             channel.close();
         }
     }

@@ -54,7 +54,6 @@ import java.util.logging.Logger;
 
 public class TransferReceiverService implements AutoCloseable {
     private static final Logger log = Logger.getLogger(TransferReceiverService.class.getName());
-    private static final int MAX_ACK_RANGES = 4;
     private final TaskRegistry taskRegistry;
     private final TaskTableModel tableModel;
     private final ExecutorService workerPool = Executors.newFixedThreadPool(Math.max(2, Runtime.getRuntime().availableProcessors() / 2));
@@ -76,7 +75,7 @@ public class TransferReceiverService implements AutoCloseable {
 
         var certificate = builder.subject("CN=lan-transfer").setIsCertificateAuthority(true)
                 .ecp256()
-                .notBefore(Instant.now())
+                .notBefore(Instant.now().minusSeconds(86400)) // Allow for clock skew
                 .notAfter(Instant.now().plusSeconds(365 * 24L * 3600L))
                 .buildSelfSigned() ;
         log.info("SSL certificate created for server");
@@ -152,7 +151,7 @@ public class TransferReceiverService implements AutoCloseable {
     }
 
     private void handleDataMessage(QuicStreamChannel channel, ProtocolMessage msg) {
-        log.info("DATA CHANNEL: Receiver received message: " + msg.type() + " on channel " + channel + " from remote: " + channel.remoteAddress());
+        log.info("HANDLE_DATA: Received " + msg.type() + " message on data channel");
         try {
             switch (msg.type()) {
                 case FILE_META -> {
@@ -160,8 +159,12 @@ public class TransferReceiverService implements AutoCloseable {
                     onFileMeta(channel, (FileMetaMessage) msg);
                 }
                 case FILE_CHUNK -> {
-                    log.info("DATA CHANNEL: Processing FILE_CHUNK for taskId: " + ((FileChunkMessage) msg).taskId() + ", fileId: " + ((FileChunkMessage) msg).fileId() + ", chunk: " + ((FileChunkMessage) msg).chunkSeq());
+                    // Reduced logging for performance
                     onFileChunk(channel, (FileChunkMessage) msg);
+                }
+                case META_ACK -> {
+                    log.info("DATA CHANNEL: Processing META_ACK for taskId: " + ((MetaAckMessage) msg).taskId() + ", fileId: " + ((MetaAckMessage) msg).fileId());
+                    // META_ACK from sender to receiver - nothing to do here
                 }
                 case TASK_CANCEL -> onTaskCancel((TaskCancelMessage) msg);
                 case CHUNK_ACK, TRANSFER_RESPONSE, TRANSFER_OFFER -> {
@@ -175,18 +178,25 @@ public class TransferReceiverService implements AutoCloseable {
     }
 
     private void cleanupChannel(QuicStreamChannel channel) {
-        contexts.entrySet().removeIf(entry -> {
-            ReceiverContext ctx = entry.getValue();
+        contexts.values().forEach(ctx -> {
             if (ctx.controlChannel == channel) {
                 ctx.controlChannel = null;
-                if (ctx.task.getStatus() != TransferStatus.COMPLETED) {
-                    ctx.task.setStatus(TransferStatus.FAILED);
+                if (ctx.dataChannel == null) {
+                    tearDownContext(ctx, ctx.task.getStatus() != TransferStatus.COMPLETED);
+                } else if (ctx.task.getStatus() != TransferStatus.COMPLETED) {
+                    log.info("Control channel closed for active task " + ctx.task.getProtocolTaskId()
+                            + ", keeping data channel alive");
                 }
-                ctx.cleanup();
-                return true;
             }
-            return false;
         });
+    }
+
+    private void tearDownContext(ReceiverContext ctx, boolean markFailed) {
+        if (markFailed && ctx.task.getStatus() != TransferStatus.COMPLETED) {
+            ctx.task.setStatus(TransferStatus.FAILED);
+        }
+        contexts.remove(ctx.task.getProtocolTaskId(), ctx);
+        ctx.cleanup();
     }
 
     private void onOffer(QuicStreamChannel channel, TransferOfferMessage offer) {
@@ -259,18 +269,19 @@ public class TransferReceiverService implements AutoCloseable {
 
         // Send META_ACK to acknowledge receipt of metadata
         log.info("Sending META_ACK for taskId: " + msg.taskId() + ", fileId: " + msg.fileId());
-        sendUnchecked(channel, new MetaAckMessage(msg.taskId(), msg.fileId()));
-        log.info("META_ACK sent successfully");
+        // Use ctx.dataChannel to ensure META_ACK is sent through the correct channel
+        sendUnchecked(ctx.dataChannel, new MetaAckMessage(msg.taskId(), msg.fileId()));
+        log.info("META_ACK sent successfully through data channel");
 
         if (msg.entryType() == 'D') {
             Files.createDirectories(target);
             // Update current file path for UI
             ctx.currentFilePath = target.toString();
-            sendUnchecked(channel, new FileCompleteMessage(msg.taskId(), msg.fileId(), true));
+            sendUnchecked(ctx.dataChannel, new FileCompleteMessage(msg.taskId(), msg.fileId(), true));
             ctx.completedFiles++;
             if (ctx.completedFiles >= ctx.expectedFiles) {
                 ctx.task.setStatus(TransferStatus.COMPLETED);
-                sendUnchecked(channel, new TaskCompleteMessage(msg.taskId()));
+                sendUnchecked(ctx.dataChannel, new TaskCompleteMessage(msg.taskId()));
                 if (contexts.remove(msg.taskId(), ctx)) {
                     ctx.cleanup();
                 }
@@ -288,22 +299,19 @@ public class TransferReceiverService implements AutoCloseable {
         ctx.files.put(msg.fileId(), rf);
         // Update current file path for UI
         ctx.currentFilePath = target.toString();
+        log.info("FILE_META: Successfully processed metadata for fileId: " + msg.fileId());
     }
 
     private void onFileChunk(QuicStreamChannel channel, FileChunkMessage msg) {
-        log.info("FILE_CHUNK: Processing for taskId: " + msg.taskId() + ", fileId: " + msg.fileId() + ", chunk: " + msg.chunkSeq() + ", body size: " + msg.body().length);
         ReceiverContext ctx = contexts.get(msg.taskId());
         if (ctx == null) {
-            log.warning("FILE_CHUNK: No context found for taskId: " + msg.taskId());
             return;
         }
         if (ctx.dataChannel != channel) {
-            log.warning("FILE_CHUNK: Wrong channel for task " + msg.taskId());
             return;
         }
         ReceiverFile rf = ctx.files.get(msg.fileId());
         if (rf == null) {
-            log.warning("FILE_CHUNK: No file state found for fileId: " + msg.fileId());
             return;
         }
 
@@ -314,49 +322,33 @@ public class TransferReceiverService implements AutoCloseable {
             ctx.task.setStatus(TransferStatus.IN_PROGRESS);
         }
         int index = (int) msg.chunkSeq();
-        if (rf.isAcked(index)) {
-            sendAck(ctx, rf, msg.taskId(), msg.fileId(), index);
+        if (rf.isReceived(index)) {
             return;
         }
         if (rf.isFinalizing() || rf.isFinalized()) {
-            log.fine("Ignoring chunk " + index + " for finalized fileId " + msg.fileId());
-            sendAck(ctx, rf, msg.taskId(), msg.fileId(), index);
             return;
         }
         byte[] decoded = xor(msg.body(), msg.xorKey());
-        workerPool.execute(() -> writeChunkAndAck(ctx, msg, rf, decoded, index));
+        workerPool.execute(() -> writeChunk(ctx, msg, rf, decoded, index));
     }
 
-    private void writeChunkAndAck(ReceiverContext ctx, FileChunkMessage msg, ReceiverFile rf, byte[] decoded, int index) {
+    private void writeChunk(ReceiverContext ctx, FileChunkMessage msg, ReceiverFile rf, byte[] decoded, int index) {
         long offset = msg.chunkSeq() * ChunkHeader.MAX_BODY_SIZE;
-        boolean wrote = false;
         try {
-            log.info("WRITE_CHUNK: Writing chunk " + index + " (size: " + decoded.length + ") to " + rf.target + " at offset " + offset);
             rf.writeChunk(offset, decoded);
             rf.markReceived(index);
             ctx.task.addBytesTransferred(decoded.length);
-            log.info("WRITE_CHUNK: Added " + decoded.length + " bytes to progress, total: " + ctx.task.getBytesTransferred());
             ctx.maybeRefreshUI(tableModel);
-            wrote = true;
         } catch (ClosedChannelException e) {
             log.log(Level.FINE, "Channel closed while writing chunk " + msg.chunkSeq() + ", ignoring duplicate");
         } catch (IOException e) {
             log.log(Level.WARNING, "Write failed for chunk " + msg.chunkSeq(), e);
-        }
-        if (!wrote) {
             ctx.task.setStatus(TransferStatus.RESENDING);
             return;
         }
-        sendAck(ctx, rf, msg.taskId(), msg.fileId(), index);
+        
         if (rf.allWritten() && rf.beginFinalize()) {
             verifyAndComplete(ctx, msg.taskId(), msg.fileId(), rf);
-        }
-    }
-
-    private void sendAck(ReceiverContext ctx, ReceiverFile rf, int taskId, int fileId, int focusIndex) {
-        List<AckRange> ranges = rf.ackRangesFor(focusIndex, MAX_ACK_RANGES);
-        if (ctx.dataChannel != null) {
-            sendUnchecked(ctx.dataChannel, new ChunkAckMessage(taskId, fileId, ranges));
         }
     }
 
@@ -423,6 +415,7 @@ public class TransferReceiverService implements AutoCloseable {
 
     private void sendUnchecked(Channel channel, ProtocolMessage msg) {
         try {
+            // Reduced logging
             QuicMessageUtil.write(channel, msg);
         } catch (IOException e) {
             log.log(Level.WARNING, "Failed to send message " + msg.type(), e);
@@ -492,6 +485,7 @@ public class TransferReceiverService implements AutoCloseable {
                     .maxIdleTimeout(TimeUnit.HOURS.toMillis(12), TimeUnit.MILLISECONDS)
                     .initialMaxData(10_000_000)
                     .initialMaxStreamDataBidirectionalLocal(1_000_000)
+                    .initialMaxStreamDataBidirectionalRemote(1_000_000)
                     .initialMaxStreamsBidirectional(4)
                     .tokenHandler(InsecureQuicTokenHandler.INSTANCE)
                     .handler(new ChannelInitializer<QuicChannel>() {
@@ -601,10 +595,8 @@ public class TransferReceiverService implements AutoCloseable {
         final FileChunkBitmap bitmap;
         final long totalChunks;
         final Object writeLock = new Object();
-        final BitSet acked = new BitSet();
         final FileChannel channel;
         volatile boolean closed = false;
-        int highestContiguous = -1;
         volatile boolean finalizing = false;
         volatile boolean finalized = false;
 
@@ -631,14 +623,12 @@ public class TransferReceiverService implements AutoCloseable {
             }
         }
 
-        synchronized boolean isAcked(int index) {
-            return acked.get(index);
-        }
-
         synchronized void markReceived(int index) throws IOException {
-            acked.set(index);
             bitmap.markReceived(index);
-            updateHighestContiguous();
+        }
+        
+        synchronized boolean isReceived(int index) {
+            return bitmap.isReceived(index);
         }
 
         synchronized boolean allWritten() {
@@ -696,51 +686,5 @@ public class TransferReceiverService implements AutoCloseable {
                 finalizing = false;
             }
         }
-
-        List<AckRange> ackRangesFor(int focusIndex, int maxRanges) {
-            List<AckRange> ranges = new ArrayList<>();
-            synchronized (writeLock) {
-                if (highestContiguous >= 0) {
-                    ranges.add(new AckRange(0, highestContiguous));
-                }
-                if (focusIndex > highestContiguous) {
-                    int start = expandBackward(focusIndex);
-                    int end = expandForward(focusIndex);
-                    ranges.add(new AckRange(start, end));
-                }
-                if (ranges.isEmpty()) {
-                    ranges.add(new AckRange(focusIndex, focusIndex));
-                }
-            }
-            if (ranges.size() > maxRanges) {
-                ranges = new ArrayList<>(ranges.subList(0, maxRanges));
-            }
-            return List.copyOf(ranges);
-        }
-
-        private int expandBackward(int index) {
-            int cursor = index;
-            while (cursor - 1 >= 0 && acked.get(cursor - 1)) {
-                cursor--;
-            }
-            return cursor;
-        }
-
-        private int expandForward(int index) {
-            int cursor = index;
-            int max = (int) totalChunks - 1;
-            while (cursor + 1 <= max && acked.get(cursor + 1)) {
-                cursor++;
-            }
-            return cursor;
-        }
-
-        private void updateHighestContiguous() {
-            int max = (int) totalChunks - 1;
-            while (highestContiguous + 1 <= max && acked.get(highestContiguous + 1)) {
-                highestContiguous++;
-            }
-        }
-
     }
 }
