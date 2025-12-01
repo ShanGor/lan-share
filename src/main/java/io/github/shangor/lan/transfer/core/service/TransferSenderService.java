@@ -220,13 +220,13 @@ public class TransferSenderService implements AutoCloseable {
                 new ChannelInitializer<QuicStreamChannel>() {
                     @Override
                     protected void initChannel(QuicStreamChannel ch) {
-                        log.info("Data stream created: {} for taskId: {}", ch, ctx.taskId);
+                        log.debug("Data stream created: {} for taskId: {}", ch, ctx.taskId);
                         ch.pipeline().addLast(QuicMessageUtil.newFrameDecoder());
                         ch.pipeline().addLast(QuicMessageUtil.newInboundHandler((channel, message) -> {
-                            log.info("Data channel received message: {} for taskId: {}", message.type(), ctx.taskId);
+                            log.debug("Data channel received message: {} for taskId: {}", message.type(), ctx.taskId);
                             handleDataMessage(ctx, message);
                         }));
-                        log.info("Data stream pipeline configured for taskId: {}", ctx.taskId);
+                        log.debug("Data stream pipeline configured for taskId: {}", ctx.taskId);
                     }
                 });
         streamFuture.sync();
@@ -271,7 +271,7 @@ public class TransferSenderService implements AutoCloseable {
         }
 
         // Check data channel state before sending
-        log.info("FILE_META: Preparing to send for taskId: {}, fileId: {}, path: {}, dataChannel: {}, dataChannel active: {}, acknowledged: {}", taskId, fileId, relPath, ctx.dataStreamChannel, ctx.dataStreamChannel != null && ctx.dataStreamChannel.isActive(), Boolean.TRUE.equals(ctx.fileMetaAcked.get(fileId)));
+        log.debug("FILE_META: Preparing to send for taskId: {}, fileId: {}, path: {}, dataChannel: {}, dataChannel active: {}, acknowledged: {}", taskId, fileId, relPath, ctx.dataStreamChannel, ctx.dataStreamChannel != null && ctx.dataStreamChannel.isActive(), Boolean.TRUE.equals(ctx.fileMetaAcked.get(fileId)));
 
         sendData(ctx, msg);
 
@@ -279,7 +279,7 @@ public class TransferSenderService implements AutoCloseable {
         ScheduledFuture<?> retryFuture = scheduler.scheduleWithFixedDelay(() -> {
             if (Boolean.TRUE.equals(ctx.fileMetaAcked.get(fileId))) {
                 // If acknowledged, cancel this retry task
-                log.info("FILE_META for fileId {} was acknowledged, cancelling retry", fileId);
+                log.warn("FILE_META for fileId {} was acknowledged, cancelling retry", fileId);
                 ScheduledFuture<?> future = ctx.chunkTimeouts.remove(-fileId);
                 if (future != null) {
                     future.cancel(false);
@@ -287,7 +287,7 @@ public class TransferSenderService implements AutoCloseable {
                 return;
             }
             // Still not acknowledged, retry sending FILE_META
-            log.info("FILE_META for fileId {} not acknowledged yet, retrying... Data channel active: {}", fileId, ctx.dataStreamChannel != null && ctx.dataStreamChannel.isActive());
+            log.warn("FILE_META for fileId {} not acknowledged yet, retrying... Data channel active: {}", fileId, ctx.dataStreamChannel != null && ctx.dataStreamChannel.isActive());
             try {
                 // Update current file path for UI during retries
                 SenderEntry retryEntry = ctx.entries.get(fileId);
@@ -306,7 +306,7 @@ public class TransferSenderService implements AutoCloseable {
     }
 
     private void handleDataMessage(SenderContext ctx, ProtocolMessage msg) {
-        log.info("HANDLE_DATA: Received {} message for taskId: {}", msg.type(), ctx.taskId);
+        log.debug("HANDLE_DATA: Received {} message for taskId: {}", msg.type(), ctx.taskId);
         switch (msg.type()) {
             case CHUNK_ACK -> { /* Ignore, we rely on QUIC reliability */ }
             case FILE_COMPLETE -> onFileComplete((FileCompleteMessage) msg);
@@ -357,23 +357,23 @@ public class TransferSenderService implements AutoCloseable {
 
     private void onMetaAck(SenderContext ctx, MetaAckMessage msg) {
         int fileId = msg.fileId();
-        log.info("META_ACK: Received acknowledgment for fileId: {} for taskId: {}", fileId, ctx.taskId);
+        log.debug("META_ACK: Received acknowledgment for fileId: {} for taskId: {}", fileId, ctx.taskId);
         Boolean acked = ctx.fileMetaAcked.put(fileId, true);
         if (Boolean.TRUE.equals(acked)) {
-            log.info("META_ACK: FileId {} already acknowledged for taskId: {}", fileId, ctx.taskId);
+            log.debug("META_ACK: FileId {} already acknowledged for taskId: {}", fileId, ctx.taskId);
             return; // Already acknowledged
         }
         ScheduledFuture<?> future = ctx.chunkTimeouts.remove(-fileId);
         if (future != null) {
             future.cancel(false);
-            log.info("META_ACK: Cancelled retry timeout for fileId: {} for taskId: {}", fileId, ctx.taskId);
+            log.warn("META_ACK: Cancelled retry timeout for fileId: {} for taskId: {}", fileId, ctx.taskId);
         }
         SenderEntry entry = ctx.entries.get(fileId);
         if (entry != null) {
             if (entry.isDirectory()) {
-                log.info("META_ACK: Directory confirmed, skipping streaming for fileId: {} for taskId: {}", fileId, ctx.taskId);
+                log.debug("META_ACK: Directory confirmed, skipping streaming for fileId: {} for taskId: {}", fileId, ctx.taskId);
             } else {
-                log.info("META_ACK: Starting file streaming for fileId: {} for taskId: {}", fileId, ctx.taskId);
+                log.debug("META_ACK: Starting file streaming for fileId: {} for taskId: {}", fileId, ctx.taskId);
                 sendExecutor.submit(() -> startFileStreaming(ctx, fileId, entry));
             }
         } else {
@@ -397,7 +397,7 @@ public class TransferSenderService implements AutoCloseable {
 
     private void streamFile(SenderContext ctx, SenderFileState state) {
         try {
-            log.info("Starting streaming for fileId: " + state.fileId);
+            log.debug("Starting streaming for fileId: {}", state.fileId);
             long seq = 0;
             while (seq < state.totalChunks) {
                 if (state.closed) return;
@@ -421,7 +421,7 @@ public class TransferSenderService implements AutoCloseable {
 
                 seq++;
             }
-            log.info("Finished streaming for fileId: {}", state.fileId);
+            log.debug("Finished streaming for fileId: {}", state.fileId);
         } catch (IOException e) {
             log.warn("Failed to stream file {}", state.path, e);
             ctx.task.setStatus(TransferStatus.FAILED);

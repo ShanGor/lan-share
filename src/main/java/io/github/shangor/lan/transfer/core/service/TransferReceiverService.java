@@ -134,7 +134,7 @@ public class TransferReceiverService implements AutoCloseable {
     }
 
     private void handleIncoming(QuicStreamChannel channel, ProtocolMessage msg) {
-        log.info("Receiver received message: {} on channel {} from remote: {}", msg.type(), channel, channel.remoteAddress());
+        log.debug("Receiver received message: {} on channel {} from remote: {}", msg.type(), channel, channel.remoteAddress());
         try {
             switch (msg.type()) {
                 case TRANSFER_OFFER -> {
@@ -154,7 +154,7 @@ public class TransferReceiverService implements AutoCloseable {
     }
 
     private void handleDataMessage(QuicStreamChannel channel, ProtocolMessage msg) {
-        log.info("HANDLE_DATA: Received {} message on data channel", msg.type());
+        log.debug("HANDLE_DATA: Received {} message on data channel", msg.type());
         try {
             switch (msg.type()) {
                 case FILE_META -> {
@@ -261,7 +261,7 @@ public class TransferReceiverService implements AutoCloseable {
     }
 
     private void onFileMeta(QuicStreamChannel channel, FileMetaMessage msg) throws IOException {
-        log.info("FILE_META: Processing for taskId: " + msg.taskId() + ", fileId: " + msg.fileId() + ", path: " + msg.relativePath() + ", size: " + msg.size());
+        log.debug("FILE_META: Processing for taskId: " + msg.taskId() + ", fileId: " + msg.fileId() + ", path: " + msg.relativePath() + ", size: " + msg.size());
         ReceiverContext ctx = contexts.get(msg.taskId());
         if (ctx == null) {
             log.warn("FILE_META: No context found for taskId: {}", msg.taskId());
@@ -281,10 +281,10 @@ public class TransferReceiverService implements AutoCloseable {
         }
 
         // Send META_ACK to acknowledge receipt of metadata
-        log.info("Sending META_ACK for taskId: {}, fileId: {}", msg.taskId(), msg.fileId());
+        log.debug("Sending META_ACK for taskId: {}, fileId: {}", msg.taskId(), msg.fileId());
         // Use ctx.dataChannel to ensure META_ACK is sent through the correct channel
         sendUnchecked(ctx.dataChannel, new MetaAckMessage(msg.taskId(), msg.fileId()));
-        log.info("META_ACK sent successfully through data channel");
+        log.debug("META_ACK sent successfully through data channel");
 
         if (msg.entryType() == 'D') {
             Files.createDirectories(target);
@@ -312,7 +312,7 @@ public class TransferReceiverService implements AutoCloseable {
         ctx.files.put(msg.fileId(), rf);
         // Update current file path for UI
         ctx.currentFilePath = target.toString();
-        log.info("FILE_META: Successfully processed metadata for fileId: " + msg.fileId());
+        log.debug("FILE_META: Successfully processed metadata for fileId: " + msg.fileId());
     }
 
     private void onFileChunk(QuicStreamChannel channel, FileChunkMessage msg) {
@@ -501,13 +501,13 @@ public class TransferReceiverService implements AutoCloseable {
                     .streamHandler(new ChannelInitializer<QuicStreamChannel>() {
                         @Override
                         protected void initChannel(QuicStreamChannel ch) {
-                            log.info("DATA SERVER: Stream channel created: " + ch + " from remote: " + ch.remoteAddress());
+                            log.debug("DATA SERVER: Stream channel created: " + ch + " from remote: " + ch.remoteAddress());
                             context.dataChannel = ch;
                             ch.pipeline().addLast(QuicMessageUtil.newFrameDecoder());
                             ch.pipeline().addLast(QuicMessageUtil.newInboundHandler((channel, message) ->
                                     handleDataMessage((QuicStreamChannel) channel, message)));
                             ch.closeFuture().addListener(f -> {
-                                log.info("DATA SERVER: Stream channel closed: " + ch);
+                                log.debug("DATA SERVER: Stream channel closed: " + ch);
                                 context.dataChannel = null;
                             });
                         }
