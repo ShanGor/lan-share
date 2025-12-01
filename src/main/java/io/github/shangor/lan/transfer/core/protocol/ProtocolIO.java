@@ -49,6 +49,7 @@ public final class ProtocolIO {
                 case FILE_RESEND_REQUEST -> FileResendRequestMessage.read(in);
                 case TASK_COMPLETE -> TaskCompleteMessage.read(in);
                 case TASK_CANCEL -> TaskCancelMessage.read(in);
+                case TASK_PAUSE -> TaskPauseMessage.read(in);
                 case CHUNK_ACK -> ChunkAckMessage.read(in);
                 case CHUNK_REQUEST -> ChunkRequestMessage.read(in);
                 case DIR_CREATE -> DirectoryCreateMessage.read(in);

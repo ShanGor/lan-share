@@ -42,6 +42,11 @@ public class FileChunkBitmap {
         return bits.cardinality() >= chunkCount;
     }
 
+    public synchronized int firstMissingChunk() {
+        int idx = bits.nextClearBit(0);
+        return Math.min(idx, chunkCount);
+    }
+
     public int chunkCount() {
         return chunkCount;
     }

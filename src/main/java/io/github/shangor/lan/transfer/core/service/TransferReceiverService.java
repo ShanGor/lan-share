@@ -13,6 +13,7 @@ import io.github.shangor.lan.transfer.core.protocol.MetaAckMessage;
 import io.github.shangor.lan.transfer.core.protocol.ProtocolMessage;
 import io.github.shangor.lan.transfer.core.protocol.TaskCancelMessage;
 import io.github.shangor.lan.transfer.core.protocol.TaskCompleteMessage;
+import io.github.shangor.lan.transfer.core.protocol.TaskPauseMessage;
 import io.github.shangor.lan.transfer.core.protocol.TransferOfferMessage;
 import io.github.shangor.lan.transfer.core.protocol.TransferResponseMessage;
 import io.github.shangor.lan.transfer.ui.common.TaskTableModel;
@@ -145,6 +146,7 @@ public class TransferReceiverService implements AutoCloseable {
                 }
                 case FILE_META, FILE_CHUNK -> log.debug("Ignoring data message on control channel");
                 case TASK_CANCEL -> onTaskCancel((TaskCancelMessage) msg);
+                case TASK_PAUSE -> onTaskPauseMessage((TaskPauseMessage) msg);
                 case CHUNK_ACK -> { /* ignore */ }
                 default -> log.debug("Ignoring message {}", msg.type());
             }
@@ -167,6 +169,7 @@ public class TransferReceiverService implements AutoCloseable {
                     // META_ACK from sender to receiver - nothing to do here
                 }
                 case TASK_CANCEL -> onTaskCancel((TaskCancelMessage) msg);
+                case TASK_PAUSE -> onTaskPauseMessage((TaskPauseMessage) msg);
                 case CHUNK_ACK, TRANSFER_RESPONSE, TRANSFER_OFFER -> {
                     // ignore on data channel
                 }
@@ -187,7 +190,6 @@ public class TransferReceiverService implements AutoCloseable {
             log.warn("FILE_META: Ignoring for task {} from unexpected channel.", msg.taskId());
             return;
         }
-        sendMetaAckAsync(ctx, msg.taskId(), msg.fileId());
         handleFileMetaAsync(ctx, msg);
     }
 
@@ -284,7 +286,6 @@ public class TransferReceiverService implements AutoCloseable {
 
     private void onFileMeta(ReceiverContext ctx, FileMetaMessage msg) throws IOException {
         log.debug("FILE_META: Processing for taskId: " + msg.taskId() + ", fileId: " + msg.fileId() + ", path: " + msg.relativePath() + ", size: " + msg.size());
-        // Normalize incoming path separators and convert to platform-specific format
         String normalizedRelativePath = PathUtil.normalizePathSeparators(msg.relativePath());
         String platformPath = PathUtil.toPlatformPath(normalizedRelativePath);
         Path target = destinationRoot.resolve(platformPath).normalize();
@@ -295,10 +296,10 @@ public class TransferReceiverService implements AutoCloseable {
 
         if (msg.entryType() == 'D') {
             Files.createDirectories(target);
-            // Update current file path for UI
             ctx.currentFilePath = target.toString();
+            sendMetaAckAsync(ctx, msg.taskId(), msg.fileId(), 0L, false);
             sendUnchecked(ctx.dataChannel, new FileCompleteMessage(msg.taskId(), msg.fileId(), true));
-
+            ctx.resumeCredits.remove(msg.fileId());
             if (ctx.completedFiles.incrementAndGet() >= ctx.expectedFiles) {
                 ctx.task.setStatus(TransferStatus.COMPLETED);
                 sendUnchecked(ctx.dataChannel, new TaskCompleteMessage(msg.taskId()));
@@ -308,18 +309,111 @@ public class TransferReceiverService implements AutoCloseable {
             }
             return;
         }
-        // File
+
         Files.createDirectories(target.getParent());
         Path tempFile = target.resolveSibling(target.getFileName() + ".part");
-        Files.deleteIfExists(tempFile);
-        Files.createFile(tempFile);
+        Path bitmapPath = tempFile.resolveSibling(tempFile.getFileName() + ".bitmap");
         long chunkCount = (msg.size() + ChunkHeader.MAX_BODY_SIZE - 1) / ChunkHeader.MAX_BODY_SIZE;
-        FileChunkBitmap bitmap = new FileChunkBitmap(tempFile.resolveSibling(tempFile.getFileName() + ".bitmap"), (int) chunkCount);
-        ReceiverFile rf = new ReceiverFile(target, tempFile, msg.size(), msg.md5(), bitmap, chunkCount);
-        ctx.files.put(msg.fileId(), rf);
-        // Update current file path for UI
+
+        ResumeDecision decision = prepareResumeDecision(target, tempFile, bitmapPath, msg, chunkCount);
+        sendMetaAckAsync(ctx, msg.taskId(), msg.fileId(), decision.resumeFromSeq(), decision.alreadyComplete());
+        applyResumeCredit(ctx, msg.fileId(), msg.size(), decision.resumeFromSeq(), decision.alreadyComplete());
         ctx.currentFilePath = target.toString();
-        log.debug("FILE_META: Successfully processed metadata for fileId: " + msg.fileId());
+
+        if (decision.alreadyComplete()) {
+            sendUnchecked(ctx.dataChannel, new FileCompleteMessage(msg.taskId(), msg.fileId(), true));
+            ctx.resumeCredits.remove(msg.fileId());
+            if (ctx.completedFiles.incrementAndGet() >= ctx.expectedFiles) {
+                ctx.task.setStatus(TransferStatus.COMPLETED);
+                sendUnchecked(ctx.dataChannel, new TaskCompleteMessage(msg.taskId()));
+                if (contexts.remove(msg.taskId(), ctx)) {
+                    ctx.cleanup();
+                }
+            }
+            return;
+        }
+
+        ReceiverFile rf = decision.receiverFile();
+        ctx.files.put(msg.fileId(), rf);
+        log.debug("FILE_META: Prepared receiver state for fileId: {} resumeFromSeq: {}", msg.fileId(), decision.resumeFromSeq());
+    }
+
+    private ResumeDecision prepareResumeDecision(Path target, Path tempFile, Path bitmapPath, FileMetaMessage msg,
+                                                 long chunkCount) throws IOException {
+        if (Files.exists(target)) {
+            String md5 = new ChecksumService().md5(target);
+            if (md5.equalsIgnoreCase(msg.md5())) {
+                log.info("FILE_META: Target already exists with matching checksum for {}", target);
+                return new ResumeDecision(chunkCount, true, null);
+            }
+            log.info("FILE_META: Existing target {} checksum mismatch, overwriting", target);
+            Files.delete(target);
+        }
+
+        boolean partialExists = Files.exists(tempFile) && Files.exists(bitmapPath);
+        if (!partialExists) {
+            Files.deleteIfExists(tempFile);
+            Files.deleteIfExists(bitmapPath);
+            Files.createFile(tempFile);
+            FileChunkBitmap bitmap = new FileChunkBitmap(bitmapPath, (int) chunkCount);
+            ReceiverFile rf = new ReceiverFile(target, tempFile, msg.size(), msg.md5(), bitmap, chunkCount);
+            return new ResumeDecision(0L, false, rf);
+        }
+
+        FileChunkBitmap bitmap = new FileChunkBitmap(bitmapPath, (int) chunkCount);
+        if (bitmap.allReceived()) {
+            log.info("FILE_META: Partial file {} already contains all chunks; verifying", tempFile);
+            if (finalizeExistingTemp(tempFile, target, bitmapPath, msg.md5())) {
+                return new ResumeDecision(chunkCount, true, null);
+            }
+            log.info("FILE_META: Existing temp data invalid, restarting transfer for {}", target);
+            Files.deleteIfExists(tempFile);
+            Files.deleteIfExists(bitmapPath);
+            Files.createFile(tempFile);
+            FileChunkBitmap fresh = new FileChunkBitmap(bitmapPath, (int) chunkCount);
+            ReceiverFile rf = new ReceiverFile(target, tempFile, msg.size(), msg.md5(), fresh, chunkCount);
+            return new ResumeDecision(0L, false, rf);
+        }
+
+        long resumeFrom = bitmap.firstMissingChunk();
+        resumeFrom = Math.min(resumeFrom, chunkCount);
+        log.info("FILE_META: Resuming {} from chunk {}", target, resumeFrom);
+        ReceiverFile rf = new ReceiverFile(target, tempFile, msg.size(), msg.md5(), bitmap, chunkCount);
+        return new ResumeDecision(resumeFrom, false, rf);
+    }
+
+    private void applyResumeCredit(ReceiverContext ctx, int fileId, long fileSize, long resumeSeq,
+                                   boolean alreadyComplete) {
+        long creditedBytes = alreadyComplete ? fileSize
+                : Math.min(fileSize, resumeSeq * (long) ChunkHeader.MAX_BODY_SIZE);
+        Long previous = ctx.resumeCredits.put(fileId, creditedBytes);
+        long delta = creditedBytes - (previous == null ? 0 : previous);
+        if (delta > 0) {
+            ctx.task.addBytesTransferred(delta);
+            ctx.maybeRefreshUI(tableModel);
+        }
+    }
+
+    private boolean finalizeExistingTemp(Path tempFile, Path target, Path bitmapPath, String expectedMd5) {
+        try {
+            String md5 = new ChecksumService().md5(tempFile);
+            if (!md5.equalsIgnoreCase(expectedMd5)) {
+                log.warn("FILE_META: Temp file {} checksum mismatch; expected {} got {}", tempFile, expectedMd5, md5);
+                return false;
+            }
+            if (!moveFileWithRetry(tempFile, target)) {
+                log.warn("FILE_META: Failed to promote temp file {} to {}", tempFile, target);
+                return false;
+            }
+            Files.deleteIfExists(bitmapPath);
+            return true;
+        } catch (IOException e) {
+            log.warn("FILE_META: Failed to finalize existing temp file {}", tempFile, e);
+            return false;
+        }
+    }
+
+    private record ResumeDecision(long resumeFromSeq, boolean alreadyComplete, ReceiverFile receiverFile) {
     }
 
     private void onFileChunk(QuicStreamChannel channel, FileChunkMessage msg) {
@@ -328,6 +422,10 @@ public class TransferReceiverService implements AutoCloseable {
             return;
         }
         if (ctx.dataChannel != channel) {
+            return;
+        }
+        if (ctx.paused) {
+            log.debug("Task {} paused; ignoring chunk {}", ctx.task.getProtocolTaskId(), msg.chunkSeq());
             return;
         }
         ReceiverFile rf = ctx.files.get(msg.fileId());
@@ -415,6 +513,7 @@ public class TransferReceiverService implements AutoCloseable {
             log.warn("Failed to verify file", e);
         } finally {
             ctx.files.remove(fileId);
+            ctx.resumeCredits.remove(fileId);
             rf.markFinalized();
             try {
                 rf.closeChannel();
@@ -432,6 +531,51 @@ public class TransferReceiverService implements AutoCloseable {
         }
     }
 
+    public void pauseTask(String taskId) {
+        ReceiverContext ctx = findContext(taskId);
+        if (ctx == null) {
+            return;
+        }
+        ctx.setPaused(true);
+        ctx.task.setStatus(TransferStatus.PAUSED);
+        sendPauseMessage(ctx, true);
+    }
+
+    public void resumeTask(String taskId) {
+        ReceiverContext ctx = findContext(taskId);
+        if (ctx == null) {
+            return;
+        }
+        ctx.setPaused(false);
+        if (ctx.task.getStatus() == TransferStatus.PAUSED) {
+            ctx.task.setStatus(TransferStatus.IN_PROGRESS);
+        }
+        sendPauseMessage(ctx, false);
+    }
+
+    private void onTaskPauseMessage(TaskPauseMessage msg) {
+        ReceiverContext ctx = contexts.get(msg.taskId());
+        if (ctx == null) {
+            return;
+        }
+        ctx.setPaused(msg.pause());
+        if (msg.pause()) {
+            ctx.task.setStatus(TransferStatus.PAUSED);
+        } else if (ctx.task.getStatus() == TransferStatus.PAUSED) {
+            ctx.task.setStatus(TransferStatus.IN_PROGRESS);
+        }
+    }
+
+    private ReceiverContext findContext(String paddedTaskId) {
+        try {
+            int id = Integer.parseInt(paddedTaskId);
+            return contexts.get(id);
+        } catch (NumberFormatException e) {
+            log.warn("Invalid task id for pause/resume: {}", paddedTaskId);
+            return null;
+        }
+    }
+
     private void sendUnchecked(Channel channel, ProtocolMessage msg) {
         try {
             // Reduced logging
@@ -441,15 +585,24 @@ public class TransferReceiverService implements AutoCloseable {
         }
     }
 
-    private void sendMetaAckAsync(ReceiverContext ctx, int taskId, int fileId) {
+    private void sendPauseMessage(ReceiverContext ctx, boolean pause) {
+        Channel channel = ctx.controlChannel != null ? ctx.controlChannel : ctx.dataChannel;
+        if (channel == null) {
+            return;
+        }
+        sendUnchecked(channel, new TaskPauseMessage(ctx.task.getProtocolTaskId(), pause));
+    }
+
+    private void sendMetaAckAsync(ReceiverContext ctx, int taskId, int fileId, long resumeFromSeq, boolean alreadyComplete) {
         QuicStreamChannel dataChannel = ctx.dataChannel;
         if (dataChannel == null) {
             log.debug("META_ACK: Skipping send for taskId {} fileId {} because data channel is null", taskId, fileId);
             return;
         }
         Runnable ackTask = () -> {
-            log.debug("Sending META_ACK for taskId: {}, fileId: {}", taskId, fileId);
-            sendUnchecked(dataChannel, new MetaAckMessage(taskId, fileId));
+            log.debug("Sending META_ACK for taskId: {}, fileId: {} resumeFrom: {} complete: {}", taskId, fileId,
+                    resumeFromSeq, alreadyComplete);
+            sendUnchecked(dataChannel, new MetaAckMessage(taskId, fileId, resumeFromSeq, alreadyComplete));
         };
         if (dataChannel.eventLoop().inEventLoop()) {
             ackTask.run();
@@ -570,6 +723,8 @@ public class TransferReceiverService implements AutoCloseable {
         volatile QuicStreamChannel controlChannel;
         volatile QuicStreamChannel dataChannel;
         DataTransferServer dataServer;
+        volatile boolean paused = false;
+        final Map<Integer, Long> resumeCredits = new ConcurrentHashMap<>();
 
         ReceiverContext(TransferTask task, QuicStreamChannel controlChannel, int expectedFiles) {
             this.task = task;
@@ -603,6 +758,7 @@ public class TransferReceiverService implements AutoCloseable {
         void cleanup() {
             files.values().forEach(ReceiverFile::closeQuietly);
             files.clear();
+            resumeCredits.clear();
             if (controlChannel != null) {
                 controlChannel.close();
             }
@@ -612,6 +768,10 @@ public class TransferReceiverService implements AutoCloseable {
             if (dataServer != null) {
                 dataServer.close();
             }
+        }
+
+        void setPaused(boolean value) {
+            paused = value;
         }
     }
 

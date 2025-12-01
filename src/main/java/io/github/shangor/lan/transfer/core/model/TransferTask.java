@@ -17,6 +17,8 @@ public class TransferTask {
     private final Instant createdAt;
     private volatile Instant updatedAt;
     private volatile Instant finishedAt;
+    private volatile String remoteHost = "";
+    private volatile int remotePort = -1;
 
     public TransferTask(int protocolTaskId, Path source, Path destination, long totalBytes) {
         this.protocolTaskId = protocolTaskId & 0xFFFF;
@@ -99,5 +101,22 @@ public class TransferTask {
     private boolean isTerminal(TransferStatus status) {
         return status == TransferStatus.COMPLETED || status == TransferStatus.FAILED
                 || status == TransferStatus.CANCELED || status == TransferStatus.REJECTED;
+    }
+
+    public void setRemoteEndpoint(String host, int port) {
+        this.remoteHost = host == null ? "" : host;
+        this.remotePort = port;
+    }
+
+    public String getRemoteHost() {
+        return remoteHost;
+    }
+
+    public int getRemotePort() {
+        return remotePort;
+    }
+
+    public boolean hasRemoteEndpoint() {
+        return remotePort > 0 && remoteHost != null && !remoteHost.isBlank();
     }
 }

@@ -13,6 +13,7 @@ import io.github.shangor.lan.transfer.core.protocol.MetaAckMessage;
 import io.github.shangor.lan.transfer.core.protocol.ProtocolMessage;
 import io.github.shangor.lan.transfer.core.protocol.TaskCancelMessage;
 import io.github.shangor.lan.transfer.core.protocol.TaskCompleteMessage;
+import io.github.shangor.lan.transfer.core.protocol.TaskPauseMessage;
 import io.github.shangor.lan.transfer.core.protocol.TransferOfferMessage;
 import io.github.shangor.lan.transfer.core.protocol.TransferResponseMessage;
 import io.github.shangor.lan.transfer.ui.common.TaskTableModel;
@@ -112,6 +113,7 @@ public class TransferSenderService implements AutoCloseable {
             long totalBytes = totalSize(files);
             TransferTask task = new TransferTask(taskId, folder, Path.of(""), totalBytes);
             task.setStatus(TransferStatus.PENDING);
+            task.setRemoteEndpoint(receiver.getHostString(), receiver.getPort());
             taskRegistry.add(task);
             if (tableModel != null) {
                 tableModel.addTask(task);
@@ -269,7 +271,7 @@ public class TransferSenderService implements AutoCloseable {
         // Send directory metadata
         for (Path dir : ctx.directories) {
             String rel = PathUtil.normalizePathSeparators(ctx.root.relativize(dir).toString());
-            ctx.entries.put(id, new SenderEntry(rel, dir, true, 0));
+            ctx.entries.put(id, new SenderEntry(rel, dir, true, 0, 0L));
             sendFileMetaWithRetry(ctx, ctx.taskId, id, 'D', rel, 0L, "");
             id++;
         }
@@ -280,7 +282,7 @@ public class TransferSenderService implements AutoCloseable {
             long totalChunks = (size + ChunkHeader.MAX_BODY_SIZE - 1) / ChunkHeader.MAX_BODY_SIZE;
             String rel = PathUtil.normalizePathSeparators(ctx.root.relativize(file).toString());
             String md5 = new ChecksumService().md5(file);
-            ctx.entries.put(id, new SenderEntry(rel, file, false, totalChunks));
+            ctx.entries.put(id, new SenderEntry(rel, file, false, totalChunks, size));
             sendFileMetaWithRetry(ctx, ctx.taskId, id, 'F', rel, size, md5);
             id++;
         }
@@ -374,6 +376,38 @@ public class TransferSenderService implements AutoCloseable {
         return ctx.metaSendNanos.remove(fileId);
     }
 
+    private void applyResumeCredit(SenderContext ctx, int fileId, SenderEntry entry, long resumeSeq) {
+        if (resumeSeq <= 0) {
+            ctx.resumeCredits.remove(fileId);
+            return;
+        }
+        long creditedBytes = Math.min(entry.size(), resumeSeq * (long) ChunkHeader.MAX_BODY_SIZE);
+        Long previous = ctx.resumeCredits.put(fileId, creditedBytes);
+        long delta = creditedBytes - (previous == null ? 0 : previous);
+        if (delta > 0) {
+            ctx.task.addBytesTransferred(delta);
+            ctx.maybeRefreshUI(tableModel);
+        }
+    }
+
+    private SenderContext getContextByTaskId(String paddedTaskId) {
+        try {
+            int id = Integer.parseInt(paddedTaskId);
+            return contexts.get(id);
+        } catch (NumberFormatException e) {
+            log.warn("Invalid task id for pause/resume: {}", paddedTaskId);
+            return null;
+        }
+    }
+
+    private void sendPauseSignal(SenderContext ctx, boolean pause) {
+        try {
+            sendControl(ctx, new TaskPauseMessage(ctx.taskId, pause));
+        } catch (IOException e) {
+            log.warn("Failed to send pause signal for task {}", ctx.taskId, e);
+        }
+    }
+
     private void handleDataMessage(SenderContext ctx, ProtocolMessage msg) {
         log.debug("HANDLE_DATA: Received {} message for taskId: {}", msg.type(), ctx.taskId);
         switch (msg.type()) {
@@ -382,6 +416,7 @@ public class TransferSenderService implements AutoCloseable {
             case FILE_COMPLETE -> onFileComplete((FileCompleteMessage) msg);
             case META_ACK -> onMetaAck(ctx, (MetaAckMessage) msg);
             case TASK_COMPLETE -> onTaskComplete((TaskCompleteMessage) msg);
+            case TASK_PAUSE -> onTaskPause(ctx, (TaskPauseMessage) msg);
             default -> log.warn("Unknown data message type: {}", msg.type());
         }
     }
@@ -394,6 +429,7 @@ public class TransferSenderService implements AutoCloseable {
                 contexts.remove(ctx.taskId);
                 ctx.cleanup();
             }
+            case TASK_PAUSE -> onTaskPause(ctx, (TaskPauseMessage) msg);
             default -> log.debug("Ignoring control message {}", msg.type());
         }
     }
@@ -449,33 +485,62 @@ public class TransferSenderService implements AutoCloseable {
             if (entry.isDirectory()) {
                 log.debug("META_ACK: Directory confirmed, skipping streaming for fileId: {} for taskId: {}", fileId,
                         ctx.taskId);
-            } else {
-                log.debug("META_ACK: Starting file streaming for fileId: {} for taskId: {}", fileId, ctx.taskId);
-                sendExecutor.submit(() -> startFileStreaming(ctx, fileId, entry));
+                return;
             }
+
+            long resumeSeq = Math.max(0L, msg.resumeFromSeq());
+            if (msg.alreadyComplete()) {
+                log.info("META_ACK: Receiver already completed file {} (task {})", entry.relPath(), ctx.taskId);
+                applyResumeCredit(ctx, fileId, entry, entry.totalChunks());
+                return;
+            }
+
+            applyResumeCredit(ctx, fileId, entry, resumeSeq);
+            if (resumeSeq >= entry.totalChunks()) {
+                log.info("META_ACK: No chunks to transfer for fileId {} task {}", fileId, ctx.taskId);
+                return;
+            }
+            log.debug("META_ACK: Starting file streaming for fileId: {} resumeFrom: {} for taskId: {}", fileId,
+                    resumeSeq, ctx.taskId);
+            sendExecutor.submit(() -> startFileStreaming(ctx, fileId, entry, resumeSeq));
         } else {
             log.warn("META_ACK: No entry found for fileId: {} for taskId: {}", fileId, ctx.taskId);
         }
     }
 
-    private void startFileStreaming(SenderContext ctx, int fileId, SenderEntry entry) {
+    private void onTaskPause(SenderContext ctx, TaskPauseMessage msg) {
+        ctx.setPaused(msg.pause());
+        if (msg.pause()) {
+            ctx.task.setStatus(TransferStatus.PAUSED);
+        } else if (ctx.task.getStatus() == TransferStatus.PAUSED) {
+            ctx.task.setStatus(TransferStatus.IN_PROGRESS);
+        }
+        ctx.maybeRefreshUI(tableModel);
+    }
+
+    private void startFileStreaming(SenderContext ctx, int fileId, SenderEntry entry, long startSeq) {
         try (SenderFileState state = ctx.ensureFileState(fileId, entry)) {
 
             ctx.currentFilePath = entry.path().toString();
             ctx.maybeRefreshUI(tableModel);
 
             // Stream the file asynchronously
-            streamFile(ctx, state);
+            streamFile(ctx, state, startSeq);
         } catch (IOException e) {
             log.error("Failed to open file channel for streaming: {}", entry.path(), e);
             ctx.task.setStatus(TransferStatus.FAILED);
         }
     }
 
-    private void streamFile(SenderContext ctx, SenderFileState state) {
+    private void streamFile(SenderContext ctx, SenderFileState state, long startSeq) {
         try {
             log.debug("Starting streaming for fileId: {}", state.fileId);
-            long seq = 0;
+            long seq = Math.max(0, startSeq);
+            if (seq >= state.totalChunks) {
+                log.debug("No chunks to stream for fileId {} (resume seq {} >= total {})", state.fileId, seq,
+                        state.totalChunks);
+                return;
+            }
             while (seq < state.totalChunks) {
                 if (state.closed)
                     return;
@@ -483,7 +548,7 @@ public class TransferSenderService implements AutoCloseable {
                 // Flow control: wait if channel is not writable
                 ctx.lock.lock();
                 try {
-                    while (ctx.dataStreamChannel != null && !ctx.dataStreamChannel.isWritable()) {
+                    while ((ctx.dataStreamChannel != null && !ctx.dataStreamChannel.isWritable()) || ctx.paused) {
                         ctx.writableCondition.await();
                     }
                 } catch (InterruptedException e) {
@@ -550,6 +615,28 @@ public class TransferSenderService implements AutoCloseable {
             }
             ctx.cleanup();
         }
+    }
+
+    public void pauseTask(String paddedTaskId) {
+        SenderContext ctx = getContextByTaskId(paddedTaskId);
+        if (ctx == null) {
+            return;
+        }
+        ctx.setPaused(true);
+        ctx.task.setStatus(TransferStatus.PAUSED);
+        sendPauseSignal(ctx, true);
+    }
+
+    public void resumeTask(String paddedTaskId) {
+        SenderContext ctx = getContextByTaskId(paddedTaskId);
+        if (ctx == null) {
+            return;
+        }
+        ctx.setPaused(false);
+        if (ctx.task.getStatus() == TransferStatus.PAUSED) {
+            ctx.task.setStatus(TransferStatus.IN_PROGRESS);
+        }
+        sendPauseSignal(ctx, false);
     }
 
     private byte[] readChunk(FileChannel channel, long seq) throws IOException {
@@ -628,6 +715,7 @@ public class TransferSenderService implements AutoCloseable {
         final Map<Integer, ScheduledFuture<?>> metaRetryTasks = new ConcurrentHashMap<>();
         final Map<Integer, Integer> metaRetryAttempts = new ConcurrentHashMap<>();
         final Map<Integer, Long> metaSendNanos = new ConcurrentHashMap<>();
+        final Map<Integer, Long> resumeCredits = new ConcurrentHashMap<>();
         final List<Integer> completedFiles = new ArrayList<>();
         final Map<Integer, Boolean> fileMetaAcked = new ConcurrentHashMap<>(); // Track if FILE_META is acknowledged
         final Map<Integer, SenderFileState> fileStates = new ConcurrentHashMap<>();
@@ -641,6 +729,7 @@ public class TransferSenderService implements AutoCloseable {
         volatile QuicStreamChannel dataStreamChannel;
         volatile boolean entriesStarted = false;
         volatile boolean taskIdReleased = false;
+        volatile boolean paused = false;
 
         volatile long lastUiUpdateNanos = System.nanoTime();
         volatile long lastTelemetryLogNanos = System.nanoTime();
@@ -696,6 +785,7 @@ public class TransferSenderService implements AutoCloseable {
                     log.debug("Failed to close channel for fileId {}", fileId, e);
                 }
             }
+            resumeCredits.remove(fileId);
         }
 
         void cleanup() {
@@ -703,6 +793,7 @@ public class TransferSenderService implements AutoCloseable {
             metaRetryTasks.clear();
             metaRetryAttempts.clear();
             metaSendNanos.clear();
+            resumeCredits.clear();
             metaWindow.drainPermits();
             metaWindow.release(MAX_INFLIGHT_FILE_META);
             fileStates.values().forEach(state -> {
@@ -734,6 +825,16 @@ public class TransferSenderService implements AutoCloseable {
             releaseTaskId();
         }
 
+        void setPaused(boolean value) {
+            lock.lock();
+            try {
+                paused = value;
+                writableCondition.signalAll();
+            } finally {
+                lock.unlock();
+            }
+        }
+
         void releaseTaskId() {
             if (!taskIdReleased) {
                 taskIdReleased = true;
@@ -761,7 +862,7 @@ public class TransferSenderService implements AutoCloseable {
         }
     }
 
-    private record SenderEntry(String relPath, Path path, boolean isDirectory, long totalChunks) {
+    private record SenderEntry(String relPath, Path path, boolean isDirectory, long totalChunks, long size) {
     }
 
     private static class SenderFileState implements AutoCloseable {

@@ -30,4 +30,8 @@ public class TaskRegistry {
             task.setStatus(status);
         }
     }
+
+    public TransferTask remove(String taskId) {
+        return tasks.remove(taskId);
+    }
 }

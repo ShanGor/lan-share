@@ -9,6 +9,7 @@ public enum ProtocolMessageType {
     FILE_RESEND_REQUEST,
     TASK_COMPLETE,
     TASK_CANCEL,
+    TASK_PAUSE,
     CHUNK_ACK,
     CHUNK_REQUEST,
     DIR_CREATE,

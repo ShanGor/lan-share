@@ -49,6 +49,19 @@ Single-purpose LAN file transfer tool with GUI. Sender chooses a folder, Receive
   - Directories are signaled via metadata type=D; receiver creates the directory and sends an ACK (`FILE_COMPLETE` success=true) so the sender can proceed.
   - When a file passes MD5 verification, receiver sends a file-done signal (`FILE_COMPLETE`) so sender and receiver can log completion and update task progress.
 - **Storage**: Receiver writes to destination directory chosen by user; create subfolders to mirror relative paths; avoid overwriting partial files from failed attempts (e.g., use temp names until success). Persist per-task metadata to allow resume after restart.
+- **Existing-file detection / resume**:
+  - When FILE_META arrives, the receiver checks for: (a) a completed target file, (b) a `.part` file plus bitmap, or (c) absence of both.
+  - If the completed target file already exists, compute MD5; if it matches the sender’s MD5, immediately signal `FILE_COMPLETE` success and inform the sender so the file is skipped.
+  - If only partial artifacts exist (`.part` + bitmap), resume from the last recorded chunk instead of re-transferring already written data.
+  - The sender must interpret `FILE_COMPLETE` success/skip responses and mark the file finished without streaming chunks.
+- **Pause/Resume control**:
+  - Both sender and receiver UIs expose a Pause action per task. When invoked, the requester flushes any in-flight chunks, signals the peer to pause, and stops reading/writing until the task is resumed manually.
+  - Resume restarts metadata/chunk flow exactly where it left off, reusing the partial state already persisted by the receiver and sender.
+  - Paused tasks must survive app restarts and remain resumable.
+- **Task history management**:
+  - Task list retains completed/failed tasks until explicitly removed by the user.
+  - Each historical task offers `Continue` (resume the same folder/receiver pairing) and `Remove` actions.
+  - Continuing a task reuses the persisted task metadata and partial file state to resume any incomplete files.
 - **Concurrency**: Support multiple simultaneous tasks; the receiver may process multiple transfers in parallel, subject to resource limits.
 - **Limits**: Support files larger than memory; stream to disk using QUIC's built-in flow control.
 

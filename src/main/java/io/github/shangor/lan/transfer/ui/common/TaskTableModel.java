@@ -77,6 +77,33 @@ public class TaskTableModel extends AbstractTableModel {
         fireTableDataChanged();
     }
 
+    public TransferTask getTaskAt(int rowIndex) {
+        if (rowIndex < 0 || rowIndex >= tasks.size()) {
+            return null;
+        }
+        return tasks.get(rowIndex);
+    }
+
+    public TransferTask findTask(String taskId) {
+        for (TransferTask task : tasks) {
+            if (task.getTaskId().equals(taskId)) {
+                return task;
+            }
+        }
+        return null;
+    }
+
+    public void removeTask(String taskId) {
+        tasks.removeIf(task -> task.getTaskId().equals(taskId));
+        lastBytes.remove(taskId);
+        lastTimes.remove(taskId);
+        speeds.remove(taskId);
+        currentFileMap.remove(taskId);
+        rtts.remove(taskId);
+        windows.remove(taskId);
+        fireTableDataChanged();
+    }
+
     public void updateStatus(String taskId, TransferStatus status) {
         for (TransferTask task : tasks) {
             if (task.getTaskId().equals(taskId)) {

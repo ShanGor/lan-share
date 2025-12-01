@@ -1,5 +1,7 @@
 package io.github.shangor.lan.transfer.ui.receiver;
 
+import io.github.shangor.lan.transfer.core.model.TransferStatus;
+import io.github.shangor.lan.transfer.core.model.TransferTask;
 import io.github.shangor.lan.transfer.core.service.TaskRegistry;
 import io.github.shangor.lan.transfer.core.service.TransferReceiverService;
 import io.github.shangor.lan.transfer.core.util.UserPreferences;
@@ -99,7 +101,20 @@ public class ReceiverFrame extends JFrame {
         detailPanel.setBorder(javax.swing.BorderFactory.createTitledBorder("Current File"));
         JLabel currentFileLabel = new JLabel(" ");
         detailPanel.add(currentFileLabel);
-        add(detailPanel, BorderLayout.SOUTH);
+
+        JButton pauseTaskButton = new JButton("Pause");
+        JButton resumeTaskButton = new JButton("Resume");
+        JButton removeTaskButton = new JButton("Remove");
+
+        JPanel actionsPanel = new JPanel();
+        actionsPanel.add(pauseTaskButton);
+        actionsPanel.add(resumeTaskButton);
+        actionsPanel.add(removeTaskButton);
+
+        JPanel bottomPanel = new JPanel(new BorderLayout());
+        bottomPanel.add(detailPanel, BorderLayout.CENTER);
+        bottomPanel.add(actionsPanel, BorderLayout.EAST);
+        add(bottomPanel, BorderLayout.SOUTH);
 
         new Timer(1000, e -> {
             tableModel.refresh();
@@ -190,6 +205,42 @@ public class ReceiverFrame extends JFrame {
             statusLabel.setText("Status: Stopped");
         });
 
+        pauseTaskButton.addActionListener(e -> {
+            TransferTask task = getSelectedTask(table);
+            if (task == null) {
+                JOptionPane.showMessageDialog(this, "Select a task to pause.", "Pause", JOptionPane.INFORMATION_MESSAGE);
+                return;
+            }
+            if (!isActiveStatus(task.getStatus())) {
+                JOptionPane.showMessageDialog(this, "Only active tasks can be paused.", "Pause", JOptionPane.WARNING_MESSAGE);
+                return;
+            }
+            receiverService.pauseTask(task.getTaskId());
+        });
+
+        resumeTaskButton.addActionListener(e -> {
+            TransferTask task = getSelectedTask(table);
+            if (task == null) {
+                JOptionPane.showMessageDialog(this, "Select a task to resume.", "Resume", JOptionPane.INFORMATION_MESSAGE);
+                return;
+            }
+            receiverService.resumeTask(task.getTaskId());
+        });
+
+        removeTaskButton.addActionListener(e -> {
+            TransferTask task = getSelectedTask(table);
+            if (task == null) {
+                JOptionPane.showMessageDialog(this, "Select a task to remove.", "Remove", JOptionPane.INFORMATION_MESSAGE);
+                return;
+            }
+            if (isActiveStatus(task.getStatus())) {
+                JOptionPane.showMessageDialog(this, "Stop or pause the task before removing it.", "Remove", JOptionPane.WARNING_MESSAGE);
+                return;
+            }
+            taskRegistry.remove(task.getTaskId());
+            tableModel.removeTask(task.getTaskId());
+        });
+
         // Auto-start listening on the default port if destination is set
         if (!prefs.destination().isEmpty()) {
             try {
@@ -213,5 +264,20 @@ public class ReceiverFrame extends JFrame {
                 receiverService.close();
             }
         });
+    }
+
+    private TransferTask getSelectedTask(JTable table) {
+        int row = table.getSelectedRow();
+        if (row < 0) {
+            return null;
+        }
+        return tableModel.getTaskAt(row);
+    }
+
+    private boolean isActiveStatus(TransferStatus status) {
+        return status == TransferStatus.IN_PROGRESS
+                || status == TransferStatus.RESENDING
+                || status == TransferStatus.PAUSED
+                || status == TransferStatus.PENDING;
     }
 }
