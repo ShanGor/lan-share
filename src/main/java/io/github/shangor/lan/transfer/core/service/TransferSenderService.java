@@ -3,6 +3,7 @@ package io.github.shangor.lan.transfer.core.service;
 import io.github.shangor.lan.transfer.core.model.TransferStatus;
 import io.github.shangor.lan.transfer.core.model.TransferTask;
 import io.github.shangor.lan.transfer.core.net.QuicMessageUtil;
+import io.github.shangor.lan.transfer.core.util.PathUtil;
 import io.github.shangor.lan.transfer.core.protocol.ProtocolIO;
 import io.github.shangor.lan.transfer.core.protocol.ChunkHeader;
 import io.github.shangor.lan.transfer.core.protocol.FileChunkMessage;
@@ -242,7 +243,7 @@ public class TransferSenderService implements AutoCloseable {
 
         // Send directory metadata
         for (Path dir : ctx.directories) {
-            String rel = ctx.root.relativize(dir).toString();
+            String rel = PathUtil.normalizePathSeparators(ctx.root.relativize(dir).toString());
             ctx.entries.put(id, new SenderEntry(rel, dir, true, 0));
             sendFileMetaWithRetry(ctx, ctx.taskId, id, 'D', rel, 0L, "");
             id++;
@@ -252,7 +253,7 @@ public class TransferSenderService implements AutoCloseable {
         for (Path file : ctx.files) {
             long size = Files.size(file);
             long totalChunks = (size + ChunkHeader.MAX_BODY_SIZE - 1) / ChunkHeader.MAX_BODY_SIZE;
-            String rel = ctx.root.relativize(file).toString();
+            String rel = PathUtil.normalizePathSeparators(ctx.root.relativize(file).toString());
             String md5 = new ChecksumService().md5(file);
             ctx.entries.put(id, new SenderEntry(rel, file, false, totalChunks));
             sendFileMetaWithRetry(ctx, ctx.taskId, id, 'F', rel, size, md5);

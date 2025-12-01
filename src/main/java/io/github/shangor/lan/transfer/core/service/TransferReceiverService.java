@@ -4,6 +4,7 @@ import io.github.shangor.lan.transfer.core.model.FileChunkBitmap;
 import io.github.shangor.lan.transfer.core.model.TransferStatus;
 import io.github.shangor.lan.transfer.core.model.TransferTask;
 import io.github.shangor.lan.transfer.core.net.QuicMessageUtil;
+import io.github.shangor.lan.transfer.core.util.PathUtil;
 import io.github.shangor.lan.transfer.core.protocol.ChunkHeader;
 import io.github.shangor.lan.transfer.core.protocol.FileChunkMessage;
 import io.github.shangor.lan.transfer.core.protocol.FileCompleteMessage;
@@ -270,7 +271,10 @@ public class TransferReceiverService implements AutoCloseable {
             log.warn("FILE_META: Ignoring for task {} from unexpected channel.", msg.taskId());
             return;
         }
-        Path target = destinationRoot.resolve(msg.relativePath()).normalize();
+        // Normalize incoming path separators and convert to platform-specific format
+        String normalizedRelativePath = PathUtil.normalizePathSeparators(msg.relativePath());
+        String platformPath = PathUtil.toPlatformPath(normalizedRelativePath);
+        Path target = destinationRoot.resolve(platformPath).normalize();
         if (!target.startsWith(destinationRoot)) {
             log.warn("Rejected path outside destination: {}", target);
             return;
