@@ -91,7 +91,7 @@ public class ReceiverFrame extends JFrame {
         table.getColumnModel().getColumn(4).setPreferredWidth(80); // Transferred
         table.getColumnModel().getColumn(5).setPreferredWidth(80); // Total
         table.getColumnModel().getColumn(6).setPreferredWidth(80); // Duration
-        table.getColumnModel().getColumn(7).setPreferredWidth(200); // Current File
+        table.getColumnModel().getColumn(7).setPreferredWidth(200); // Sending Path
         add(new JScrollPane(table), BorderLayout.CENTER);
 
         // Add detail panel to show current file
@@ -110,6 +110,7 @@ public class ReceiverFrame extends JFrame {
                 String taskId = (String) tableModel.getValueAt(i, 0);
                 String status = tableModel.getValueAt(i, 1).toString();
                 if (status.equals("IN_PROGRESS") || status.equals("RESENDING")) {
+                    // Get the current file being processed
                     currentFile = tableModel.getCurrentFile(taskId);
                     if (currentFile != null && !currentFile.isEmpty()) {
                         break; // Use first active task found
@@ -119,8 +120,8 @@ public class ReceiverFrame extends JFrame {
             // If no active task file found, try selected row as fallback
             if ((currentFile == null || currentFile.isEmpty()) && table.getSelectedRow() >= 0) {
                 int selectedRow = table.getSelectedRow();
-                String taskId = (String) tableModel.getValueAt(selectedRow, 0);
-                currentFile = tableModel.getCurrentFile(taskId);
+                String selectedTaskId = (String) tableModel.getValueAt(selectedRow, 0);
+                currentFile = tableModel.getCurrentFile(selectedTaskId);
             }
             if (currentFile != null && !currentFile.isEmpty()) {
                 currentFileLabel.setText(currentFile);

@@ -59,7 +59,10 @@ public class TransferTask {
 
     public void addBytesTransferred(long delta) {
         bytesTransferred.addAndGet(delta);
-        this.updatedAt = Instant.now();
+        // Only update timestamp if task is not completed
+        if (status != TransferStatus.COMPLETED && status != TransferStatus.FAILED && status != TransferStatus.CANCELED) {
+            this.updatedAt = Instant.now();
+        }
     }
 
     public long getTotalBytes() {
