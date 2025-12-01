@@ -39,6 +39,7 @@ import javax.swing.SwingUtilities;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.nio.channels.ClosedChannelException;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -519,17 +520,21 @@ public class TransferSenderService implements AutoCloseable {
     }
 
     private void startFileStreaming(SenderContext ctx, int fileId, SenderEntry entry, long startSeq) {
-        try (SenderFileState state = ctx.ensureFileState(fileId, entry)) {
-
-            ctx.currentFilePath = entry.path().toString();
-            ctx.maybeRefreshUI(tableModel);
-
-            // Stream the file asynchronously
-            streamFile(ctx, state, startSeq);
+        SenderFileState state;
+        try {
+            state = ctx.ensureFileState(fileId, entry);
         } catch (IOException e) {
             log.error("Failed to open file channel for streaming: {}", entry.path(), e);
             ctx.task.setStatus(TransferStatus.FAILED);
+            failContext(ctx);
+            return;
         }
+
+        ctx.currentFilePath = entry.path().toString();
+        ctx.maybeRefreshUI(tableModel);
+
+        // Stream the file asynchronously
+        streamFile(ctx, state, startSeq);
     }
 
     private void streamFile(SenderContext ctx, SenderFileState state, long startSeq) {
@@ -549,7 +554,18 @@ public class TransferSenderService implements AutoCloseable {
                 ctx.lock.lock();
                 try {
                     while ((ctx.dataStreamChannel != null && !ctx.dataStreamChannel.isWritable()) || ctx.paused) {
+                        // Check if channel is closed or context is cleaned up
+                        if (ctx.dataStreamChannel != null && !ctx.dataStreamChannel.isActive()) {
+                             log.warn("Data channel closed during flow control wait for fileId {}", state.fileId);
+                             return;
+                        }
                         ctx.writableCondition.await();
+
+                        // Re-check after waking up
+                        if (ctx.dataStreamChannel == null || !ctx.dataStreamChannel.isActive()) {
+                             log.warn("Data channel inactive after wait for fileId {}", state.fileId);
+                             return;
+                        }
                     }
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
@@ -558,7 +574,14 @@ public class TransferSenderService implements AutoCloseable {
                     ctx.lock.unlock();
                 }
 
-                byte[] chunk = readChunk(state.channel, seq);
+                byte[] chunk;
+                try {
+                    chunk = readChunk(state.channel, seq);
+                } catch (ClosedChannelException e) {
+                    log.warn("File channel closed while reading chunk {} for fileId {}", seq, state.fileId);
+                    return;
+                }
+
                 if (chunk.length == 0)
                     break;
 
@@ -822,6 +845,15 @@ public class TransferSenderService implements AutoCloseable {
             if (dataUdpChannel != null) {
                 dataUdpChannel.close();
             }
+
+            // Signal any waiting threads to wake up and check state
+            lock.lock();
+            try {
+                writableCondition.signalAll();
+            } finally {
+                lock.unlock();
+            }
+
             releaseTaskId();
         }
 
@@ -870,7 +902,7 @@ public class TransferSenderService implements AutoCloseable {
         final Path path;
         final long totalChunks;
         final FileChannel channel;
-        boolean closed = false;
+        volatile boolean closed = false;
 
         SenderFileState(int fileId, Path path, long totalChunks) throws IOException {
             this.fileId = fileId;

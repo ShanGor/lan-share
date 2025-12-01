@@ -52,6 +52,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+
 public class TransferReceiverService implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(TransferReceiverService.class);
     private final TaskRegistry taskRegistry;
@@ -60,7 +61,7 @@ public class TransferReceiverService implements AutoCloseable {
             Math.max(2, Runtime.getRuntime().availableProcessors() / 2),
             Math.max(2, Runtime.getRuntime().availableProcessors() / 2),
             0L, TimeUnit.MILLISECONDS,
-            new LinkedBlockingQueue<>(8192),
+            new LinkedBlockingQueue<>(ChunkHeader.MAX_WINDOW_SIZE),
             new ThreadPoolExecutor.CallerRunsPolicy()
     );
     private final Map<Integer, ReceiverContext> contexts = new ConcurrentHashMap<>();
