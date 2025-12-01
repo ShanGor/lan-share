@@ -76,7 +76,7 @@ public class TransferReceiverService implements AutoCloseable {
     }
 
     public void start(int port, Path destinationRoot) throws Exception {
-        log.info("Starting receiver on port " + port + " with destination: " + destinationRoot);
+        log.info("Starting receiver on port {} with destination: {}", port, destinationRoot);
         this.destinationRoot = destinationRoot;
         CertificateBuilder builder = new CertificateBuilder();
 
@@ -286,7 +286,7 @@ public class TransferReceiverService implements AutoCloseable {
     }
 
     private void onFileMeta(ReceiverContext ctx, FileMetaMessage msg) throws IOException {
-        log.debug("FILE_META: Processing for taskId: " + msg.taskId() + ", fileId: " + msg.fileId() + ", path: " + msg.relativePath() + ", size: " + msg.size());
+        log.debug("FILE_META: Processing for taskId: {}, fileId: {}, path: {}, size: {}", msg.taskId(), msg.fileId(), msg.relativePath(), msg.size());
         String normalizedRelativePath = PathUtil.normalizePathSeparators(msg.relativePath());
         String platformPath = PathUtil.toPlatformPath(normalizedRelativePath);
         Path target = destinationRoot.resolve(platformPath).normalize();
