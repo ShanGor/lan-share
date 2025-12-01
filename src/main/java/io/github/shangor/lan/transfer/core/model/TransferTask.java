@@ -16,6 +16,7 @@ public class TransferTask {
     private final long totalBytes;
     private final Instant createdAt;
     private volatile Instant updatedAt;
+    private volatile Instant finishedAt;
 
     public TransferTask(int protocolTaskId, Path source, Path destination, long totalBytes) {
         this.protocolTaskId = protocolTaskId & 0xFFFF;
@@ -26,6 +27,7 @@ public class TransferTask {
         this.status = TransferStatus.PENDING;
         this.createdAt = Instant.now();
         this.updatedAt = this.createdAt;
+        this.finishedAt = null;
     }
 
     public String getTaskId() {
@@ -50,7 +52,11 @@ public class TransferTask {
 
     public void setStatus(TransferStatus status) {
         this.status = status;
-        this.updatedAt = Instant.now();
+        Instant now = Instant.now();
+        this.updatedAt = now;
+        if (isTerminal(status) && finishedAt == null) {
+            finishedAt = now;
+        }
     }
 
     public long getBytesTransferred() {
@@ -59,8 +65,9 @@ public class TransferTask {
 
     public void addBytesTransferred(long delta) {
         bytesTransferred.addAndGet(delta);
-        // Only update timestamp if task is not completed
-        if (status != TransferStatus.COMPLETED && status != TransferStatus.FAILED && status != TransferStatus.CANCELED) {
+        // Only update timestamp if task is still active
+        if (status != TransferStatus.COMPLETED && status != TransferStatus.FAILED
+                && status != TransferStatus.CANCELED && status != TransferStatus.REJECTED) {
             this.updatedAt = Instant.now();
         }
     }
@@ -78,10 +85,19 @@ public class TransferTask {
     }
 
     public Duration getDuration() {
-        Instant end = updatedAt;
-        if (status == TransferStatus.IN_PROGRESS || status == TransferStatus.RESENDING || status == TransferStatus.PENDING) {
-            end = Instant.now();
+        Instant end = finishedAt;
+        if (end == null) {
+            if (status == TransferStatus.IN_PROGRESS || status == TransferStatus.RESENDING || status == TransferStatus.PENDING) {
+                end = Instant.now();
+            } else {
+                end = updatedAt;
+            }
         }
         return Duration.between(createdAt, end);
+    }
+
+    private boolean isTerminal(TransferStatus status) {
+        return status == TransferStatus.COMPLETED || status == TransferStatus.FAILED
+                || status == TransferStatus.CANCELED || status == TransferStatus.REJECTED;
     }
 }

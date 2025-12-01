@@ -51,6 +51,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
@@ -60,6 +61,11 @@ import io.netty.channel.ChannelInboundHandlerAdapter;
 
 public class TransferSenderService implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(TransferSenderService.class);
+    private static final int MAX_INFLIGHT_FILE_META = 16;
+    private static final long META_INITIAL_RETRY_DELAY_MS = 1000L;
+    private static final long META_RETRY_INTERVAL_MS = 2000L;
+    private static final int META_MAX_RETRIES = 5;
+    private static final long META_WARN_LATENCY_MS = 5000L;
 
     private final TaskRegistry taskRegistry;
     private final TaskTableModel tableModel;
@@ -282,6 +288,7 @@ public class TransferSenderService implements AutoCloseable {
 
     private void sendFileMetaWithRetry(SenderContext ctx, int taskId, int fileId, char entryType, String relPath,
                                        long size, String md5) throws IOException {
+        acquireMetaPermit(ctx);
         FileMetaMessage msg = new FileMetaMessage(taskId, fileId, entryType, relPath, size, md5);
         // Update current file path for UI
         SenderEntry entry = ctx.entries.get(fileId);
@@ -297,24 +304,44 @@ public class TransferSenderService implements AutoCloseable {
                 ctx.dataStreamChannel != null && ctx.dataStreamChannel.isActive(),
                 Boolean.TRUE.equals(ctx.fileMetaAcked.get(fileId)));
 
-        sendData(ctx, msg);
+        ctx.fileMetaAcked.put(fileId, false);
+        ctx.metaSendNanos.put(fileId, System.nanoTime());
+        ctx.metaRetryAttempts.put(fileId, 0);
+        boolean initialSendComplete = false;
+        try {
+            sendData(ctx, msg);
+            initialSendComplete = true;
+        } finally {
+            if (!initialSendComplete) {
+                ctx.fileMetaAcked.remove(fileId);
+                ctx.metaSendNanos.remove(fileId);
+                ctx.metaRetryAttempts.remove(fileId);
+                ctx.metaWindow.release();
+            }
+        }
+        if (!initialSendComplete) {
+            return;
+        }
 
         // Track that FILE_META was sent and schedule retry if no ACK received
         ScheduledFuture<?> retryFuture = scheduler.scheduleWithFixedDelay(() -> {
             if (Boolean.TRUE.equals(ctx.fileMetaAcked.get(fileId))) {
-                // If acknowledged, cancel this retry task
-                log.warn("FILE_META for fileId {} was acknowledged, cancelling retry", fileId);
-                ScheduledFuture<?> future = ctx.chunkTimeouts.remove(-fileId);
-                if (future != null) {
-                    future.cancel(false);
-                }
+                cancelMetaRetry(ctx, fileId);
                 return;
             }
-            // Still not acknowledged, retry sending FILE_META
-            log.warn("FILE_META for fileId {} not acknowledged yet, retrying... Data channel active: {}", fileId,
+            int attempt = ctx.metaRetryAttempts.compute(fileId, (id, prev) -> prev == null ? 1 : prev + 1);
+            if (attempt > META_MAX_RETRIES) {
+                log.error("FILE_META for fileId {} not acknowledged after {} retries; failing task {}", fileId,
+                        META_MAX_RETRIES, ctx.taskId);
+                cancelMetaRetry(ctx, fileId);
+                ctx.metaWindow.release();
+                ctx.task.setStatus(TransferStatus.FAILED);
+                failContext(ctx);
+                return;
+            }
+            log.debug("FILE_META retry #{} for fileId {} (data channel active: {})", attempt, fileId,
                     ctx.dataStreamChannel != null && ctx.dataStreamChannel.isActive());
             try {
-                // Update current file path for UI during retries
                 SenderEntry retryEntry = ctx.entries.get(fileId);
                 if (retryEntry != null) {
                     ctx.currentFilePath = retryEntry.path().toString();
@@ -324,10 +351,27 @@ public class TransferSenderService implements AutoCloseable {
             } catch (IOException e) {
                 log.warn("Failed to resend FILE_META for fileId {}", fileId, e);
             }
-        }, 1000, 2000, TimeUnit.MILLISECONDS); // Retry after 1s, then every 2s
+        }, META_INITIAL_RETRY_DELAY_MS, META_RETRY_INTERVAL_MS, TimeUnit.MILLISECONDS);
 
-        // Store the retry task so we can cancel it when ACK is received
-        ctx.chunkTimeouts.put(-fileId, retryFuture);
+        ctx.metaRetryTasks.put(fileId, retryFuture);
+    }
+
+    private void acquireMetaPermit(SenderContext ctx) throws IOException {
+        try {
+            ctx.metaWindow.acquire();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while waiting to send FILE_META", e);
+        }
+    }
+
+    private Long cancelMetaRetry(SenderContext ctx, int fileId) {
+        ScheduledFuture<?> future = ctx.metaRetryTasks.remove(fileId);
+        if (future != null) {
+            future.cancel(false);
+        }
+        ctx.metaRetryAttempts.remove(fileId);
+        return ctx.metaSendNanos.remove(fileId);
     }
 
     private void handleDataMessage(SenderContext ctx, ProtocolMessage msg) {
@@ -390,11 +434,16 @@ public class TransferSenderService implements AutoCloseable {
             log.debug("META_ACK: FileId {} already acknowledged for taskId: {}", fileId, ctx.taskId);
             return; // Already acknowledged
         }
-        ScheduledFuture<?> future = ctx.chunkTimeouts.remove(-fileId);
-        if (future != null) {
-            future.cancel(false);
-            log.warn("META_ACK: Cancelled retry timeout for fileId: {} for taskId: {}", fileId, ctx.taskId);
+        Long startNanos = cancelMetaRetry(ctx, fileId);
+        if (startNanos != null) {
+            long latencyMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+            if (latencyMs > META_WARN_LATENCY_MS) {
+                log.warn("META_ACK latency {} ms for fileId {} taskId {}", latencyMs, fileId, ctx.taskId);
+            } else {
+                log.debug("META_ACK latency {} ms for fileId {} taskId {}", latencyMs, fileId, ctx.taskId);
+            }
         }
+        ctx.metaWindow.release();
         SenderEntry entry = ctx.entries.get(fileId);
         if (entry != null) {
             if (entry.isDirectory()) {
@@ -576,10 +625,13 @@ public class TransferSenderService implements AutoCloseable {
         final List<Path> directories;
         final Path root;
         final Map<Integer, SenderEntry> entries = new ConcurrentHashMap<>();
-        final Map<Integer, ScheduledFuture<?>> chunkTimeouts = new ConcurrentHashMap<>();
+        final Map<Integer, ScheduledFuture<?>> metaRetryTasks = new ConcurrentHashMap<>();
+        final Map<Integer, Integer> metaRetryAttempts = new ConcurrentHashMap<>();
+        final Map<Integer, Long> metaSendNanos = new ConcurrentHashMap<>();
         final List<Integer> completedFiles = new ArrayList<>();
         final Map<Integer, Boolean> fileMetaAcked = new ConcurrentHashMap<>(); // Track if FILE_META is acknowledged
         final Map<Integer, SenderFileState> fileStates = new ConcurrentHashMap<>();
+        final Semaphore metaWindow = new Semaphore(MAX_INFLIGHT_FILE_META, true);
         volatile String currentFilePath = "";
         volatile Channel controlUdpChannel;
         volatile QuicChannel controlQuicChannel;
@@ -636,10 +688,6 @@ public class TransferSenderService implements AutoCloseable {
         }
 
         void cleanupFileState(int fileId) {
-            ScheduledFuture<?> timeout = chunkTimeouts.remove(fileId);
-            if (timeout != null) {
-                timeout.cancel(false);
-            }
             SenderFileState state = fileStates.remove(fileId);
             if (state != null) {
                 try {
@@ -651,8 +699,12 @@ public class TransferSenderService implements AutoCloseable {
         }
 
         void cleanup() {
-            chunkTimeouts.values().forEach(f -> f.cancel(false));
-            chunkTimeouts.clear();
+            metaRetryTasks.values().forEach(f -> f.cancel(false));
+            metaRetryTasks.clear();
+            metaRetryAttempts.clear();
+            metaSendNanos.clear();
+            metaWindow.drainPermits();
+            metaWindow.release(MAX_INFLIGHT_FILE_META);
             fileStates.values().forEach(state -> {
                 try {
                     state.close();

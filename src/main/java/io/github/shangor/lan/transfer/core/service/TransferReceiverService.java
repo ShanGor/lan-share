@@ -157,10 +157,7 @@ public class TransferReceiverService implements AutoCloseable {
         log.debug("HANDLE_DATA: Received {} message on data channel", msg.type());
         try {
             switch (msg.type()) {
-                case FILE_META -> {
-                    log.info("DATA CHANNEL: Processing FILE_META for taskId: {}, fileId: {}", ((FileMetaMessage) msg).taskId(), ((FileMetaMessage) msg).fileId());
-                    onFileMeta(channel, (FileMetaMessage) msg);
-                }
+                case FILE_META -> handleFileMetaMessage(channel, (FileMetaMessage) msg);
                 case FILE_CHUNK -> {
                     // Reduced logging for performance
                     onFileChunk(channel, (FileChunkMessage) msg);
@@ -178,6 +175,31 @@ public class TransferReceiverService implements AutoCloseable {
         } catch (Exception e) {
             log.warn("Error handling data message {}", msg.type(), e);
         }
+    }
+
+    private void handleFileMetaMessage(QuicStreamChannel channel, FileMetaMessage msg) {
+        ReceiverContext ctx = contexts.get(msg.taskId());
+        if (ctx == null) {
+            log.warn("FILE_META: No context found for taskId: {}", msg.taskId());
+            return;
+        }
+        if (ctx.dataChannel != channel) {
+            log.warn("FILE_META: Ignoring for task {} from unexpected channel.", msg.taskId());
+            return;
+        }
+        sendMetaAckAsync(ctx, msg.taskId(), msg.fileId());
+        handleFileMetaAsync(ctx, msg);
+    }
+
+    private void handleFileMetaAsync(ReceiverContext ctx, FileMetaMessage msg) {
+        workerPool.execute(() -> {
+            try {
+                log.info("DATA CHANNEL: Processing FILE_META for taskId: {}, fileId: {}", msg.taskId(), msg.fileId());
+                onFileMeta(ctx, msg);
+            } catch (IOException e) {
+                log.warn("Failed to process FILE_META for taskId {} fileId {}", msg.taskId(), msg.fileId(), e);
+            }
+        });
     }
 
     private void cleanupChannel(QuicStreamChannel channel) {
@@ -260,17 +282,8 @@ public class TransferReceiverService implements AutoCloseable {
         return choice == JOptionPane.YES_OPTION;
     }
 
-    private void onFileMeta(QuicStreamChannel channel, FileMetaMessage msg) throws IOException {
+    private void onFileMeta(ReceiverContext ctx, FileMetaMessage msg) throws IOException {
         log.debug("FILE_META: Processing for taskId: " + msg.taskId() + ", fileId: " + msg.fileId() + ", path: " + msg.relativePath() + ", size: " + msg.size());
-        ReceiverContext ctx = contexts.get(msg.taskId());
-        if (ctx == null) {
-            log.warn("FILE_META: No context found for taskId: {}", msg.taskId());
-            return;
-        }
-        if (ctx.dataChannel != channel) {
-            log.warn("FILE_META: Ignoring for task {} from unexpected channel.", msg.taskId());
-            return;
-        }
         // Normalize incoming path separators and convert to platform-specific format
         String normalizedRelativePath = PathUtil.normalizePathSeparators(msg.relativePath());
         String platformPath = PathUtil.toPlatformPath(normalizedRelativePath);
@@ -279,12 +292,6 @@ public class TransferReceiverService implements AutoCloseable {
             log.warn("Rejected path outside destination: {}", target);
             return;
         }
-
-        // Send META_ACK to acknowledge receipt of metadata
-        log.debug("Sending META_ACK for taskId: {}, fileId: {}", msg.taskId(), msg.fileId());
-        // Use ctx.dataChannel to ensure META_ACK is sent through the correct channel
-        sendUnchecked(ctx.dataChannel, new MetaAckMessage(msg.taskId(), msg.fileId()));
-        log.debug("META_ACK sent successfully through data channel");
 
         if (msg.entryType() == 'D') {
             Files.createDirectories(target);
@@ -431,6 +438,23 @@ public class TransferReceiverService implements AutoCloseable {
             QuicMessageUtil.write(channel, msg);
         } catch (IOException e) {
             log.warn("Failed to send message {}", msg.type(), e);
+        }
+    }
+
+    private void sendMetaAckAsync(ReceiverContext ctx, int taskId, int fileId) {
+        QuicStreamChannel dataChannel = ctx.dataChannel;
+        if (dataChannel == null) {
+            log.debug("META_ACK: Skipping send for taskId {} fileId {} because data channel is null", taskId, fileId);
+            return;
+        }
+        Runnable ackTask = () -> {
+            log.debug("Sending META_ACK for taskId: {}, fileId: {}", taskId, fileId);
+            sendUnchecked(dataChannel, new MetaAckMessage(taskId, fileId));
+        };
+        if (dataChannel.eventLoop().inEventLoop()) {
+            ackTask.run();
+        } else {
+            dataChannel.eventLoop().execute(ackTask);
         }
     }
 
